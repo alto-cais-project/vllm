@@ -114,6 +114,9 @@ class EngineCoreClient(ABC):
     def add_request(self, request: EngineCoreRequest) -> None:
         raise NotImplementedError
 
+    def stream_prefill_tokens(self, request_id: str, token_ids: list[int]) -> None:
+        raise NotImplementedError
+
     def profile(self, is_start: bool = True) -> None:
         raise NotImplementedError
 
@@ -254,6 +257,9 @@ class InprocClient(EngineCoreClient):
     def add_request(self, request: EngineCoreRequest) -> None:
         req, request_wave = self.engine_core.preprocess_add_request(request)
         self.engine_core.add_request(req, request_wave)
+
+    def stream_prefill_tokens(self, request_id: str, token_ids: list[int]) -> None:
+        self.engine_core.stream_prefill_tokens(request_id, token_ids)
 
     def abort_requests(self, request_ids: list[str]) -> None:
         if len(request_ids) > 0:
@@ -704,6 +710,9 @@ class SyncMPClient(MPClient):
             self.engines_running = True
         self._send_input(EngineCoreRequestType.ADD, request)
 
+    def steram_prefill_tokens(self, request_id: str, token_ids: list[int]) -> None:
+        self.call_utility("stream_prefill_tokens", request_id, token_ids)
+
     def abort_requests(self, request_ids: list[str]) -> None:
         if request_ids and not self.resources.engine_dead:
             self._send_input(EngineCoreRequestType.ABORT, request_ids)
@@ -904,6 +913,9 @@ class AsyncMPClient(MPClient):
         request.client_index = self.client_index
         await self._send_input(EngineCoreRequestType.ADD, request)
         self._ensure_output_queue_task()
+
+    async def stream_prefill_tokens_async(self, request_id: str, token_ids: list[int]) -> None:
+        self.call_utility_async("stream_prefill_tokens", request_id, token_ids)
 
     async def abort_requests_async(self, request_ids: list[str]) -> None:
         if request_ids and not self.resources.engine_dead:

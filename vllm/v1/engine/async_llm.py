@@ -419,6 +419,28 @@ class AsyncLLM(EngineClient):
                 logger.info("Request %s failed.", request_id)
             raise EngineGenerateError() from e
 
+    async def create_input_streamer(
+        self,
+        initial_prompt: PromptType,
+        sampling_params: SamplingParams,
+        request_id: str,
+        lora_request: Optional[LoRARequest] = None,
+        trace_headers: Optional[Mapping[str, str]] = None,
+        priority: int = 0,
+        data_parallel_rank: Optional[int] = None,
+    ) -> tuple[AsyncGenerator[RequestOutput, None], int]:
+        # TODO(claby2): Return InputStreamer as tuple second element
+        output = self.generate(
+                initial_prompt,
+                sampling_params,
+                request_id,
+                lora_request=lora_request,
+                trace_headers=trace_headers,
+                priority=priority,
+                data_parallel_rank=data_parallel_rank)
+
+        return (output, 0)
+
     def _run_output_handler(self):
         """Background loop: pulls from EngineCore and pushes to AsyncStreams."""
 

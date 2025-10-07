@@ -113,6 +113,10 @@ class Scheduler(SchedulerInterface):
 
         # req_id -> Request
         self.requests: dict[str, Request] = {}
+        # req_id -> list[int]
+        self.prefill_streams: dict[str, list[int]] = {}
+        # set[req_id]
+        self.stopped_prefill_streams: set[str] = set()
         # Scheduling policy
         if self.scheduler_config.policy == "priority":
             self.policy = SchedulingPolicy.PRIORITY
@@ -214,6 +218,17 @@ class Scheduler(SchedulerInterface):
             num_new_tokens = (request.num_tokens_with_spec +
                               request.num_output_placeholders -
                               request.num_computed_tokens)
+            if request.is_streaming_prefill and \
+                request.request_id not in self.stopped_prefill_streams:
+                # This is a streaming prefill request
+                uncomputed_prompt_tokens = request.num_prompt_tokens - request.num_computed_tokens
+                if uncomputed_prompt_tokens > 0:
+                    # Compute, but leave out the last token of the prompt
+                    max_prompt_to_compute = max(0, request.num_prompt_tokens - 1)
+                    num_new_tokens = max(
+                            0,
+                            min(num_new_tokens, max_prompt_to_compute - request.num_computed_tokens))
+
             if (0 < self.scheduler_config.long_prefill_token_threshold <
                     num_new_tokens):
                 num_new_tokens = (
@@ -1115,6 +1130,13 @@ class Scheduler(SchedulerInterface):
         self.requests[request.request_id] = request
         if self.log_stats:
             request.record_event(EngineCoreEventType.QUEUED)
+
+    def stream_prefill_tokens(self, request_id: str, token_ids: list[int]) -> None:
+        if request_id in self.stopped_prefill_streams:
+            return
+        if request_id not in self.prefill_streams:
+            self.prefill_streams[request_id] = []
+        self.prefill_streams[request_id].extend(token_ids)
 
     def finish_requests(
         self,
