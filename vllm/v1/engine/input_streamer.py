@@ -15,7 +15,7 @@ class InputStreamerAsync:
 
     def stream(self, text: str) -> None:
         assert not self._ended
-        token_ids = self._tokenizer.encode(text)
+        token_ids = self._tokenizer.encode(text, add_special_tokens=False)
         self.stream_tokens(token_ids)
 
     def stream_tokens(self, token_ids: list[int]) -> None:
