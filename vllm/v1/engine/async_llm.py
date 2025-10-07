@@ -269,6 +269,7 @@ class AsyncLLM(EngineClient):
         trace_headers: Optional[Mapping[str, str]] = None,
         priority: int = 0,
         data_parallel_rank: Optional[int] = None,
+        streaming_prefill: Optional[bool] = None,
     ) -> RequestOutputCollector:
         """Add new request to the AsyncLLM."""
 
@@ -283,7 +284,7 @@ class AsyncLLM(EngineClient):
         # Convert Input --> Request.
         prompt_str, request = self.processor.process_inputs(
             request_id, prompt, params, arrival_time, lora_request,
-            tokenization_kwargs, trace_headers, priority, data_parallel_rank)
+            tokenization_kwargs, trace_headers, priority, data_parallel_rank, streaming_prefill)
 
         if is_pooling or params.n == 1:
             await self._add_request(request, prompt_str, None, 0, queue)
@@ -329,6 +330,7 @@ class AsyncLLM(EngineClient):
         trace_headers: Optional[Mapping[str, str]] = None,
         priority: int = 0,
         data_parallel_rank: Optional[int] = None,
+        streaming_prefill: Optional[bool] = None,
     ) -> AsyncGenerator[RequestOutput, None]:
         """
         Main function called by the API server to kick off a request
@@ -376,6 +378,7 @@ class AsyncLLM(EngineClient):
                 priority=priority,
                 tokenization_kwargs=tokenization_kwargs,
                 data_parallel_rank=data_parallel_rank,
+                streaming_prefill=streaming_prefill,
             )
 
             # The output_handler task pushes items into the queue.
@@ -418,28 +421,6 @@ class AsyncLLM(EngineClient):
             if self.log_requests:
                 logger.info("Request %s failed.", request_id)
             raise EngineGenerateError() from e
-
-    async def create_input_streamer(
-        self,
-        initial_prompt: PromptType,
-        sampling_params: SamplingParams,
-        request_id: str,
-        lora_request: Optional[LoRARequest] = None,
-        trace_headers: Optional[Mapping[str, str]] = None,
-        priority: int = 0,
-        data_parallel_rank: Optional[int] = None,
-    ) -> tuple[AsyncGenerator[RequestOutput, None], int]:
-        # TODO(claby2): Return InputStreamer as tuple second element
-        output = self.generate(
-                initial_prompt,
-                sampling_params,
-                request_id,
-                lora_request=lora_request,
-                trace_headers=trace_headers,
-                priority=priority,
-                data_parallel_rank=data_parallel_rank)
-
-        return (output, 0)
 
     def _run_output_handler(self):
         """Background loop: pulls from EngineCore and pushes to AsyncStreams."""
