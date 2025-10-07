@@ -117,6 +117,9 @@ class EngineCoreClient(ABC):
     def stream_prefill_tokens(self, request_id: str, token_ids: list[int]) -> None:
         raise NotImplementedError
 
+    def stop_prefill_stream(self, request_id: str) -> None:
+        raise NotImplementedError
+
     def profile(self, is_start: bool = True) -> None:
         raise NotImplementedError
 
@@ -260,6 +263,9 @@ class InprocClient(EngineCoreClient):
 
     def stream_prefill_tokens(self, request_id: str, token_ids: list[int]) -> None:
         self.engine_core.stream_prefill_tokens(request_id, token_ids)
+
+    def stop_prefill_stream(self, request_id, str) -> None:
+        self.engine_core.stop_prefill_stream(request_id)
 
     def abort_requests(self, request_ids: list[str]) -> None:
         if len(request_ids) > 0:
@@ -710,8 +716,11 @@ class SyncMPClient(MPClient):
             self.engines_running = True
         self._send_input(EngineCoreRequestType.ADD, request)
 
-    def steram_prefill_tokens(self, request_id: str, token_ids: list[int]) -> None:
+    def stream_prefill_tokens(self, request_id: str, token_ids: list[int]) -> None:
         self.call_utility("stream_prefill_tokens", request_id, token_ids)
+
+    def stop_prefill_stream(self, request_id, str) -> None:
+        self.call_utility("stop_prefill_stream", request_id)
 
     def abort_requests(self, request_ids: list[str]) -> None:
         if request_ids and not self.resources.engine_dead:
@@ -915,7 +924,10 @@ class AsyncMPClient(MPClient):
         self._ensure_output_queue_task()
 
     async def stream_prefill_tokens_async(self, request_id: str, token_ids: list[int]) -> None:
-        self.call_utility_async("stream_prefill_tokens", request_id, token_ids)
+        await self.call_utility_async("stream_prefill_tokens", request_id, token_ids)
+
+    async def stop_prefill_stream_async(self, request_id: str) -> None:
+        await self.call_utility_async("stop_prefill_stream", request_id)
 
     async def abort_requests_async(self, request_ids: list[str]) -> None:
         if request_ids and not self.resources.engine_dead:

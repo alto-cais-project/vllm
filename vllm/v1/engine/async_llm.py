@@ -45,6 +45,7 @@ from vllm.v1.executor.abstract import Executor
 from vllm.v1.metrics.loggers import StatLoggerFactory, StatLoggerManager
 from vllm.v1.metrics.prometheus import shutdown_prometheus
 from vllm.v1.metrics.stats import IterationStats
+from vllm.v1.engine.input_streamer import InputStreamerAsync
 
 logger = init_logger(__name__)
 
@@ -421,6 +422,38 @@ class AsyncLLM(EngineClient):
             if self.log_requests:
                 logger.info("Request %s failed.", request_id)
             raise EngineGenerateError() from e
+
+    async def create_input_streamer(
+        self,
+        prompt: PromptType,
+        sampling_params: SamplingParams,
+        request_id: str,
+        lora_request: Optional[LoRARequest] = None,
+        trace_headers: Optional[Mapping[str, str]] = None,
+        priority: int = 0,
+        data_parallel_rank: Optional[int] = None,
+    ) -> tuple[RequestOutputCollector, InputStreamerAsync]:
+        # Add the request with streaming_prefill enabled
+        output_collector = self.generate(
+                prompt,
+                sampling_params,
+                request_id,
+                lora_request=lora_request,
+                trace_headers=trace_headers,
+                priority=priority,
+                data_parallel_rank=data_parallel_rank,
+                streaming_prefill=True
+        )
+
+        # Create the input streamer
+        streamer = InputStreamerAsync(
+            request_id=request_id,
+            engine_core=self.engine_core,
+            tokenizer=self.tokenizer,
+        )
+
+        return output_collector, streamer
+
 
     def _run_output_handler(self):
         """Background loop: pulls from EngineCore and pushes to AsyncStreams."""

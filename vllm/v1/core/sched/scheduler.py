@@ -1148,6 +1148,9 @@ class Scheduler(SchedulerInterface):
             self.prefill_streams[request_id] = []
         self.prefill_streams[request_id].extend(token_ids)
 
+    def stop_prefill_stream(self, request_id: str) -> None:
+        self.stopped_prefill_streams.add(request_id)
+
     def finish_requests(
         self,
         request_ids: Union[str, Iterable[str]],
