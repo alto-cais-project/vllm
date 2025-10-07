@@ -264,7 +264,7 @@ class InprocClient(EngineCoreClient):
     def stream_prefill_tokens(self, request_id: str, token_ids: list[int]) -> None:
         self.engine_core.stream_prefill_tokens(request_id, token_ids)
 
-    def stop_prefill_stream(self, request_id, str) -> None:
+    def stop_prefill_stream(self, request_id: str) -> None:
         self.engine_core.stop_prefill_stream(request_id)
 
     def abort_requests(self, request_ids: list[str]) -> None:
@@ -719,7 +719,7 @@ class SyncMPClient(MPClient):
     def stream_prefill_tokens(self, request_id: str, token_ids: list[int]) -> None:
         self.call_utility("stream_prefill_tokens", request_id, token_ids)
 
-    def stop_prefill_stream(self, request_id, str) -> None:
+    def stop_prefill_stream(self, request_id: str) -> None:
         self.call_utility("stop_prefill_stream", request_id)
 
     def abort_requests(self, request_ids: list[str]) -> None:

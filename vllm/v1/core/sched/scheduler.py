@@ -210,6 +210,14 @@ class Scheduler(SchedulerInterface):
         # For logging.
         scheduled_timestamp = time.monotonic()
 
+        # Inject streamed prefill tokens into requests.
+        for request_id, token_ids in list(self.prefill_streams.items()):
+            if token_ids and request_id in self.requests:
+                request = self.requests[request_id]
+                request.prompt_token_ids.extend(token_ids)
+                request._all_token_ids.extend(token_ids)
+                self.prefill_streams[request_id] = []
+
         # First, schedule the RUNNING requests.
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
@@ -1207,6 +1215,10 @@ class Scheduler(SchedulerInterface):
 
         if not delay_free_blocks:
             self._free_blocks(request)
+
+        # Clean up streaming prefill data structures.
+        self.prefill_streams.pop(request_id, None)
+        self.stopped_prefill_streams.discard(request_id)
 
         return kv_xfer_params
 
