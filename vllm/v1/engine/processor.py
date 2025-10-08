@@ -443,7 +443,7 @@ class Processor:
                         identifier=decoder_mm_hashes[modality][idx],
                         mm_position=decoder_mm_positions[modality][idx]))
 
-        streaming_prefill = streaming_prefill == True
+        streaming_prefill = streaming_prefill or False
 
         return prompt_str, EngineCoreRequest(
             request_id=request_id,

@@ -37,6 +37,7 @@ from vllm.utils import (Device, as_list, cancel_task_threadsafe, cdiv,
 from vllm.v1.engine import EngineCoreRequest
 from vllm.v1.engine.core_client import EngineCoreClient
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
+from vllm.v1.engine.input_streamer import InputStreamerAsync
 from vllm.v1.engine.output_processor import (OutputProcessor,
                                              RequestOutputCollector)
 from vllm.v1.engine.parallel_sampling import ParentRequest
@@ -45,7 +46,6 @@ from vllm.v1.executor.abstract import Executor
 from vllm.v1.metrics.loggers import StatLoggerFactory, StatLoggerManager
 from vllm.v1.metrics.prometheus import shutdown_prometheus
 from vllm.v1.metrics.stats import IterationStats
-from vllm.v1.engine.input_streamer import InputStreamerAsync
 
 logger = init_logger(__name__)
 
@@ -285,7 +285,8 @@ class AsyncLLM(EngineClient):
         # Convert Input --> Request.
         prompt_str, request = self.processor.process_inputs(
             request_id, prompt, params, arrival_time, lora_request,
-            tokenization_kwargs, trace_headers, priority, data_parallel_rank, streaming_prefill)
+            tokenization_kwargs, trace_headers, priority, data_parallel_rank,
+            streaming_prefill)
 
         if is_pooling or params.n == 1:
             await self._add_request(request, prompt_str, None, 0, queue)
@@ -432,18 +433,16 @@ class AsyncLLM(EngineClient):
         trace_headers: Optional[Mapping[str, str]] = None,
         priority: int = 0,
         data_parallel_rank: Optional[int] = None,
-    ) -> tuple[RequestOutputCollector, InputStreamerAsync]:
+    ) -> tuple[AsyncGenerator[RequestOutput, None], InputStreamerAsync]:
         # Add the request with streaming_prefill enabled
-        output_collector = self.generate(
-                prompt,
-                sampling_params,
-                request_id,
-                lora_request=lora_request,
-                trace_headers=trace_headers,
-                priority=priority,
-                data_parallel_rank=data_parallel_rank,
-                streaming_prefill=True
-        )
+        output_collector = self.generate(prompt,
+                                         sampling_params,
+                                         request_id,
+                                         lora_request=lora_request,
+                                         trace_headers=trace_headers,
+                                         priority=priority,
+                                         data_parallel_rank=data_parallel_rank,
+                                         streaming_prefill=True)
 
         # Create the input streamer
         streamer = InputStreamerAsync(
@@ -453,7 +452,6 @@ class AsyncLLM(EngineClient):
         )
 
         return output_collector, streamer
-
 
     def _run_output_handler(self):
         """Background loop: pulls from EngineCore and pushes to AsyncStreams."""

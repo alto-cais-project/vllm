@@ -223,19 +223,27 @@ class Scheduler(SchedulerInterface):
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
 
+            print("RUNNING", request.prompt_token_ids,
+                  request.num_computed_tokens, request.output_token_ids)
+
             num_new_tokens = (request.num_tokens_with_spec +
                               request.num_output_placeholders -
                               request.num_computed_tokens)
             if request.is_streaming_prefill and \
                 request.request_id not in self.stopped_prefill_streams:
                 # This is a streaming prefill request
-                uncomputed_prompt_tokens = len(request.prompt_token_ids) - request.num_computed_tokens
+                uncomputed_prompt_tokens = len(
+                    request.prompt_token_ids) - request.num_computed_tokens
                 if uncomputed_prompt_tokens >= 0:
                     # Compute, but leave out the last token of the prompt
-                    max_prompt_to_compute = max(0, len(request.prompt_token_ids) - 1)
+                    max_prompt_to_compute = max(
+                        0,
+                        len(request.prompt_token_ids) - 1)
                     num_new_tokens = max(
-                            0,
-                            min(num_new_tokens, max_prompt_to_compute - request.num_computed_tokens))
+                        0,
+                        min(
+                            num_new_tokens, max_prompt_to_compute -
+                            request.num_computed_tokens))
 
             if (0 < self.scheduler_config.long_prefill_token_threshold <
                     num_new_tokens):
@@ -364,6 +372,8 @@ class Scheduler(SchedulerInterface):
                     break
 
                 request = self.waiting.peek_request()
+                print("WAITING", request.prompt_token_ids,
+                      request.num_computed_tokens, request.output_token_ids)
 
                 # KVTransfer: skip request if still waiting for remote kvs.
                 if request.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
@@ -450,13 +460,18 @@ class Scheduler(SchedulerInterface):
                     if request.is_streaming_prefill and \
                         request.request_id not in self.stopped_prefill_streams:
                         # This is a streaming prefill request
-                        uncomputed_prompt_tokens = len(request.prompt_token_ids) - request.num_computed_tokens
+                        uncomputed_prompt_tokens = len(
+                            request.prompt_token_ids
+                        ) - request.num_computed_tokens
                         if uncomputed_prompt_tokens >= 0:
-                            # Compute, but leave out the last token of the prompt
-                            max_prompt_to_compute = max(0, len(request.prompt_token_ids) - 1)
+                            max_prompt_to_compute = max(
+                                0,
+                                len(request.prompt_token_ids) - 1)
                             num_new_tokens = max(
-                                    0,
-                                    min(num_new_tokens, max_prompt_to_compute - request.num_computed_tokens))
+                                0,
+                                min(
+                                    num_new_tokens, max_prompt_to_compute -
+                                    request.num_computed_tokens))
                     if (0 < self.scheduler_config.long_prefill_token_threshold
                             < num_new_tokens):
                         num_new_tokens = (
@@ -1149,7 +1164,8 @@ class Scheduler(SchedulerInterface):
         if self.log_stats:
             request.record_event(EngineCoreEventType.QUEUED)
 
-    def stream_prefill_tokens(self, request_id: str, token_ids: list[int]) -> None:
+    def stream_prefill_tokens(self, request_id: str,
+                              token_ids: list[int]) -> None:
         if request_id in self.stopped_prefill_streams:
             return
         if request_id not in self.prefill_streams:

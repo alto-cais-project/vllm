@@ -1,13 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from vllm.v1.engine.core_client import EngineCoreClient
-from vllm.v1.engine.processor import Processor
-from vllm.transformers_utils.tokenizer import AnyTokenizer
 import asyncio
 
+from vllm.transformers_utils.tokenizer import AnyTokenizer
+from vllm.v1.engine.core_client import AsyncMPClient
+
+
 class InputStreamerAsync:
-    def __init__(self, request_id: str, engine_core: EngineCoreClient, tokenizer: AnyTokenizer):
+
+    def __init__(self, request_id: str, engine_core: AsyncMPClient,
+                 tokenizer: AnyTokenizer):
         self.request_id = request_id
         self._engine_core = engine_core
         self._tokenizer = tokenizer
@@ -24,12 +27,14 @@ class InputStreamerAsync:
         if not token_ids:
             return
 
-        asyncio.create_task(self._engine_core.stream_prefill_tokens_async(self.request_id, token_ids))
+        asyncio.create_task(
+            self._engine_core.stream_prefill_tokens_async(
+                self.request_id, token_ids))
 
     def end(self) -> None:
         assert not self._ended
 
         self._ended = True
 
-        asyncio.create_task(self._engine_core.stop_prefill_stream_async(self.request_id))
-
+        asyncio.create_task(
+            self._engine_core.stop_prefill_stream_async(self.request_id))

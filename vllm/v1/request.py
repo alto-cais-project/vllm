@@ -96,7 +96,7 @@ class Request:
         self.num_computed_tokens = 0
         self.cache_salt: Optional[str] = cache_salt
 
-        self._streaming_prefill = streaming_prefill == True
+        self._streaming_prefill = streaming_prefill or False
 
         # Multi-modal related
         self.mm_features = mm_features or []

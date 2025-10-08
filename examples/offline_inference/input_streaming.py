@@ -1,8 +1,12 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import asyncio
+
 from vllm import SamplingParams
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.sampling_params import RequestOutputKind
 from vllm.v1.engine.async_llm import AsyncLLM
+
 
 async def main():
     engine_args = AsyncEngineArgs(
@@ -62,4 +66,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-

@@ -70,7 +70,8 @@ class EngineCoreRequest(
 
     trace_headers: Optional[Mapping[str, str]] = None
 
-    streaming_prefill : bool = False
+    streaming_prefill: bool = False
+
 
 class EngineCoreEventType(enum.IntEnum):
     """The type of engine core request event."""
