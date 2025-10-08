@@ -214,8 +214,7 @@ class Scheduler(SchedulerInterface):
         for request_id, token_ids in list(self.prefill_streams.items()):
             if token_ids and request_id in self.requests:
                 request = self.requests[request_id]
-                request.prompt_token_ids.extend(token_ids)
-                request._all_token_ids.extend(token_ids)
+                request.add_streamed_prompt_tokens(token_ids)
                 self.prefill_streams[request_id] = []
 
         # First, schedule the RUNNING requests.
@@ -232,13 +231,12 @@ class Scheduler(SchedulerInterface):
             if request.is_streaming_prefill and \
                 request.request_id not in self.stopped_prefill_streams:
                 # This is a streaming prefill request
-                uncomputed_prompt_tokens = len(
-                    request.prompt_token_ids) - request.num_computed_tokens
+                uncomputed_prompt_tokens = (request.current_prompt_length -
+                                            request.num_computed_tokens)
                 if uncomputed_prompt_tokens >= 0:
                     # Compute, but leave out the last token of the prompt
                     max_prompt_to_compute = max(
-                        0,
-                        len(request.prompt_token_ids) - 1)
+                        0, request.current_prompt_length - 1)
                     num_new_tokens = max(
                         0,
                         min(
@@ -460,13 +458,12 @@ class Scheduler(SchedulerInterface):
                     if request.is_streaming_prefill and \
                         request.request_id not in self.stopped_prefill_streams:
                         # This is a streaming prefill request
-                        uncomputed_prompt_tokens = len(
-                            request.prompt_token_ids
-                        ) - request.num_computed_tokens
+                        uncomputed_prompt_tokens = (
+                            request.current_prompt_length -
+                            request.num_computed_tokens)
                         if uncomputed_prompt_tokens >= 0:
                             max_prompt_to_compute = max(
-                                0,
-                                len(request.prompt_token_ids) - 1)
+                                0, request.current_prompt_length - 1)
                             num_new_tokens = max(
                                 0,
                                 min(

@@ -168,6 +168,11 @@ class Request:
         if self.get_hash_new_full_blocks is not None:
             self.block_hashes.extend(self.get_hash_new_full_blocks())
 
+    def add_streamed_prompt_tokens(self, token_ids: list[int]) -> None:
+        assert self.prompt_token_ids
+        self.prompt_token_ids.extend(token_ids)
+        self._all_token_ids.extend(token_ids)
+
     @property
     def is_output_corrupted(self) -> bool:
         return self.num_nans_in_logits > 0
@@ -187,6 +192,11 @@ class Request:
     @property
     def is_streaming_prefill(self) -> bool:
         return self._streaming_prefill
+
+    @property
+    def current_prompt_length(self) -> int:
+        assert self.prompt_token_ids
+        return len(self.prompt_token_ids)
 
     def is_finished(self) -> bool:
         return RequestStatus.is_finished(self.status)
