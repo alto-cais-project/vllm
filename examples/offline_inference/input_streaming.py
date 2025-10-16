@@ -24,7 +24,7 @@ async def main():
 
     # Create a request with input streaming enabled
     output_generator, input_streamer = await engine.create_input_streamer(
-        prompt="one two three",
+        prompt="The future of",
         sampling_params=sampling_params,
         request_id="example-request-1",
     )
@@ -46,14 +46,13 @@ async def main():
     # Stream additional prompt text dynamically
     # These can be called at any time, even while the model is processing
     await asyncio.sleep(0.1)  # Simulate some delay
-    input_streamer.stream(" four")
+    input_streamer.stream(" artificial")
 
     await asyncio.sleep(0.1)
-    input_streamer.stream(" five")
+    input_streamer.stream(" intelligence")
 
-    # Or stream tokens directly
     await asyncio.sleep(0.1)
-    input_streamer.stream_tokens([11, 89, 123])
+    input_streamer.stream(" is")
 
     # Signal that prompt streaming is complete
     input_streamer.end()
