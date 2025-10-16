@@ -638,6 +638,40 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
             # Update the cached states.
 
+            # Handle streaming prefill: update prompt tokens if provided.
+            new_prompt_token_ids = req_data.prompt_token_ids[i]
+            if new_prompt_token_ids is not None:
+                # This is a streaming prefill request with updated tokens.
+                old_num_prompt_tokens = req_state.num_prompt_tokens
+                new_num_prompt_tokens = len(new_prompt_token_ids)
+
+                if new_num_prompt_tokens != old_num_prompt_tokens:
+                    # Update CachedRequestState.
+                    req_state.prompt_token_ids = new_prompt_token_ids
+                    req_state.num_prompt_tokens = new_num_prompt_tokens
+
+                    # Update InputBatch arrays if request is in the batch.
+                    req_index = self.input_batch.req_id_to_index.get(req_id)
+                    if req_index is not None:
+                        # Update token_ids_cpu with new prompt tokens.
+                        self.input_batch.token_ids_cpu[
+                            req_index, :new_num_prompt_tokens] = (
+                                new_prompt_token_ids)
+                        self.input_batch.is_token_ids[
+                            req_index, :new_num_prompt_tokens] = True
+
+                        # Update num_prompt_tokens.
+                        self.input_batch.num_prompt_tokens[
+                            req_index] = new_num_prompt_tokens
+
+                        # Recalculate num_tokens based on new prompt length.
+                        num_output_tokens_in_batch = len(
+                            req_state.output_token_ids)
+                        self.input_batch.num_tokens[req_index] = (
+                            new_num_prompt_tokens + num_output_tokens_in_batch)
+                        self.input_batch.num_tokens_no_spec[req_index] = (
+                            new_num_prompt_tokens + num_output_tokens_in_batch)
+
             req_state.num_computed_tokens = num_computed_tokens
 
             if not is_last_rank:

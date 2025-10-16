@@ -222,9 +222,6 @@ class Scheduler(SchedulerInterface):
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
 
-            print("RUNNING", request.prompt_token_ids,
-                  request.num_computed_tokens, request.output_token_ids)
-
             num_new_tokens = (request.num_tokens_with_spec +
                               request.num_output_placeholders -
                               request.num_computed_tokens)
@@ -370,8 +367,6 @@ class Scheduler(SchedulerInterface):
                     break
 
                 request = self.waiting.peek_request()
-                print("WAITING", request.prompt_token_ids,
-                      request.num_computed_tokens, request.output_token_ids)
 
                 # KVTransfer: skip request if still waiting for remote kvs.
                 if request.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
@@ -718,6 +713,7 @@ class Scheduler(SchedulerInterface):
         new_block_ids: list[Optional[tuple[list[int], ...]]] = []
         num_computed_tokens: list[int] = []
         num_output_tokens: list[int] = []
+        prompt_token_ids: list[Optional[list[int]]] = []
 
         use_connector = self.connector is not None
         for req in itertools.chain(running_reqs, resumed_reqs):
@@ -743,6 +739,14 @@ class Scheduler(SchedulerInterface):
                 req_to_new_blocks[req_id].get_block_ids(allow_none=True))
             num_computed_tokens.append(req.num_computed_tokens)
             num_output_tokens.append(len(req.output_token_ids))
+
+            # For streaming prefill requests, send the current prompt_token_ids
+            # so the worker can update its cached state.
+            if (req.is_streaming_prefill and
+                req_id not in self.stopped_prefill_streams):
+                prompt_token_ids.append(req.prompt_token_ids)
+            else:
+                prompt_token_ids.append(None)
         # Because resumed_reqs is usually empty, it is more efficient to do
         # in-place appending so that we don't need to allocate a new list.
         resumed_from_preemption = [False] * len(running_reqs)
@@ -755,6 +759,7 @@ class Scheduler(SchedulerInterface):
             new_block_ids=new_block_ids,
             num_computed_tokens=num_computed_tokens,
             num_output_tokens=num_output_tokens,
+            prompt_token_ids=prompt_token_ids,
         )
 
     def _try_schedule_encoder_inputs(

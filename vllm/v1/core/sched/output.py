@@ -102,6 +102,10 @@ class CachedRequestData:
     new_block_ids: list[Optional[tuple[list[int], ...]]]
     num_computed_tokens: list[int]
     num_output_tokens: list[int]
+    # NOTE: prompt_token_ids is only used for streaming prefill.
+    # When a request has streaming prefill, this contains the full current
+    # prompt_token_ids list so the worker can update its cached state.
+    prompt_token_ids: list[Optional[list[int]]]
 
     @property
     def num_reqs(self) -> int:
@@ -116,6 +120,7 @@ class CachedRequestData:
             new_block_ids=[],
             num_computed_tokens=[],
             num_output_tokens=[],
+            prompt_token_ids=[],
         )
 
 
