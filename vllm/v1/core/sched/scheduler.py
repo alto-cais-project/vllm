@@ -181,6 +181,21 @@ class Scheduler(SchedulerInterface):
         )
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
 
+    def _adjust_tokens_for_streaming_prefill(self, request: Request,
+                                              num_new_tokens: int) -> int:
+        if (request.is_streaming_prefill and
+            request.request_id not in self.stopped_prefill_streams):
+            uncomputed_prompt_tokens = (request.current_prompt_length -
+                                        request.num_computed_tokens)
+            if uncomputed_prompt_tokens >= 0:
+                max_prompt_to_compute = max(0,
+                                            request.current_prompt_length - 1)
+                num_new_tokens = max(
+                    0,
+                    min(num_new_tokens,
+                        max_prompt_to_compute - request.num_computed_tokens))
+        return num_new_tokens
+
     def schedule(self) -> SchedulerOutput:
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
@@ -225,20 +240,8 @@ class Scheduler(SchedulerInterface):
             num_new_tokens = (request.num_tokens_with_spec +
                               request.num_output_placeholders -
                               request.num_computed_tokens)
-            if request.is_streaming_prefill and \
-                request.request_id not in self.stopped_prefill_streams:
-                # This is a streaming prefill request
-                uncomputed_prompt_tokens = (request.current_prompt_length -
-                                            request.num_computed_tokens)
-                if uncomputed_prompt_tokens >= 0:
-                    # Compute, but leave out the last token of the prompt
-                    max_prompt_to_compute = max(
-                        0, request.current_prompt_length - 1)
-                    num_new_tokens = max(
-                        0,
-                        min(
-                            num_new_tokens, max_prompt_to_compute -
-                            request.num_computed_tokens))
+            num_new_tokens = self._adjust_tokens_for_streaming_prefill(
+                request, num_new_tokens)
 
             if (0 < self.scheduler_config.long_prefill_token_threshold <
                     num_new_tokens):
@@ -450,20 +453,8 @@ class Scheduler(SchedulerInterface):
                     # `request.num_prompt_tokens` to consider the resumed
                     # requests, which have output tokens.
                     num_new_tokens = request.num_tokens - num_computed_tokens
-                    if request.is_streaming_prefill and \
-                        request.request_id not in self.stopped_prefill_streams:
-                        # This is a streaming prefill request
-                        uncomputed_prompt_tokens = (
-                            request.current_prompt_length -
-                            request.num_computed_tokens)
-                        if uncomputed_prompt_tokens >= 0:
-                            max_prompt_to_compute = max(
-                                0, request.current_prompt_length - 1)
-                            num_new_tokens = max(
-                                0,
-                                min(
-                                    num_new_tokens, max_prompt_to_compute -
-                                    request.num_computed_tokens))
+                    num_new_tokens = self._adjust_tokens_for_streaming_prefill(
+                        request, num_new_tokens)
                     if (0 < self.scheduler_config.long_prefill_token_threshold
                             < num_new_tokens):
                         num_new_tokens = (
