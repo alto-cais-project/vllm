@@ -173,6 +173,9 @@ class Request:
         self.prompt_token_ids.extend(token_ids)
         self._all_token_ids.extend(token_ids)
 
+        if self.get_hash_new_full_blocks is not None:
+            self.block_hashes.extend(self.get_hash_new_full_blocks())
+
     @property
     def is_output_corrupted(self) -> bool:
         return self.num_nans_in_logits > 0
