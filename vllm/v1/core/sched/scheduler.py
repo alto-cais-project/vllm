@@ -182,9 +182,9 @@ class Scheduler(SchedulerInterface):
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
 
     def _adjust_tokens_for_streaming_prefill(self, request: Request,
-                                              num_new_tokens: int) -> int:
-        if (request.is_streaming_prefill and
-            request.request_id not in self.stopped_prefill_streams):
+                                             num_new_tokens: int) -> int:
+        if (request.is_streaming_prefill
+                and not request.is_streaming_prefill_stopped):
             uncomputed_prompt_tokens = (request.current_prompt_length -
                                         request.num_computed_tokens)
             if uncomputed_prompt_tokens >= 0:
@@ -194,6 +194,10 @@ class Scheduler(SchedulerInterface):
                     0,
                     min(num_new_tokens,
                         max_prompt_to_compute - request.num_computed_tokens))
+        # print(request.prompt_token_ids, request.output_token_ids,
+        #       request.num_computed_tokens, request.current_prompt_length,
+        #       num_new_tokens, request.is_streaming_prefill, request.request_id
+        #       not in self.stopped_prefill_streams)
         return num_new_tokens
 
     def schedule(self) -> SchedulerOutput:
@@ -226,11 +230,17 @@ class Scheduler(SchedulerInterface):
         scheduled_timestamp = time.monotonic()
 
         # Inject streamed prefill tokens into requests.
+        has_new_tokens = set()
         for request_id, token_ids in list(self.prefill_streams.items()):
             if token_ids and request_id in self.requests:
+                has_new_tokens.add(request_id)
                 request = self.requests[request_id]
                 request.add_streamed_prompt_tokens(token_ids)
                 self.prefill_streams[request_id] = []
+        for request_id in self.stopped_prefill_streams:
+            if request_id not in has_new_tokens and request_id in self.requests:
+                request = self.requests[request_id]
+                request.stop_prefill_streaming()
 
         # First, schedule the RUNNING requests.
         req_index = 0
@@ -733,8 +743,8 @@ class Scheduler(SchedulerInterface):
 
             # For streaming prefill requests, send the current prompt_token_ids
             # so the worker can update its cached state.
-            if (req.is_streaming_prefill and
-                req_id not in self.stopped_prefill_streams):
+            if (req.is_streaming_prefill
+                    and not req.is_streaming_prefill_stopped):
                 prompt_token_ids.append(req.prompt_token_ids)
             else:
                 prompt_token_ids.append(None)
@@ -1159,7 +1169,8 @@ class Scheduler(SchedulerInterface):
 
     def stream_prefill_tokens(self, request_id: str,
                               token_ids: list[int]) -> None:
-        if request_id in self.stopped_prefill_streams:
+        if request_id not in self.requests or self.requests[
+                request_id].is_streaming_prefill_stopped:
             return
         if request_id not in self.prefill_streams:
             self.prefill_streams[request_id] = []

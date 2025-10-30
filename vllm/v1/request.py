@@ -97,6 +97,7 @@ class Request:
         self.cache_salt: Optional[str] = cache_salt
 
         self._streaming_prefill = streaming_prefill or False
+        self._streaming_prefill_stopped = False
 
         # Multi-modal related
         self.mm_features = mm_features or []
@@ -200,6 +201,13 @@ class Request:
     def current_prompt_length(self) -> int:
         assert self.prompt_token_ids
         return len(self.prompt_token_ids)
+
+    @property
+    def is_streaming_prefill_stopped(self) -> bool:
+        return self._streaming_prefill_stopped
+
+    def stop_prefill_streaming(self) -> None:
+        self._streaming_prefill_stopped = True
 
     def is_finished(self) -> bool:
         return RequestStatus.is_finished(self.status)

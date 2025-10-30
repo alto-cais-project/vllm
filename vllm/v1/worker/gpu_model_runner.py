@@ -1149,10 +1149,14 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         self.num_discarded_requests = len(discard_request_indices)
         self.discard_request_indices.np[:self.num_discarded_requests] = (
             discard_request_indices)
+        # print("*" * 20, discard_requests_mask)
+        # for r in self.input_batch.req_ids:
+        #     print("*" * 20, self.requests[r].prompt_token_ids)
 
         self.discard_request_indices.copy_to_gpu(self.num_discarded_requests)
 
         # Copy the tensors to the GPU.
+        # print(total_num_scheduled_tokens)
         self._prepare_input_ids(total_num_scheduled_tokens, cu_num_tokens)
 
         if self.uses_mrope:
@@ -1162,6 +1166,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 non_blocking=True)
         else:
             # Common case (1D positions)
+            # print(self.positions, total_num_scheduled_tokens)
             self.positions.copy_to_gpu(total_num_scheduled_tokens)
 
         use_spec_decode = len(
