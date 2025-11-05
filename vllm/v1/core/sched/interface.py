@@ -79,6 +79,26 @@ class SchedulerInterface(ABC):
         raise NotImplementedError
 
     @abstractmethod
+    def stream_prefill_tokens(self, request_id: str,
+                              token_ids: list[int]) -> None:
+        """Add streaming prefill tokens to a request.
+
+        Args:
+            request_id: The ID of the request streaming prefill request.
+            token_ids: the token IDs to add.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def stop_prefill_stream(self, request_id: str) -> None:
+        """Signal stop to a streaming prefill request.
+
+        Args:
+            request_id: The ID of the request streaming prefill request.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
     def finish_requests(
         self,
         request_ids: Union[str, Iterable[str]],

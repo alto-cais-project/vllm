@@ -113,6 +113,10 @@ class Scheduler(SchedulerInterface):
 
         # req_id -> Request
         self.requests: dict[str, Request] = {}
+        # req_id -> list[int]
+        self.prefill_streams: dict[str, list[int]] = {}
+        # set[req_id]
+        self.stopped_prefill_streams: set[str] = set()
         # Scheduling policy
         if self.scheduler_config.policy == "priority":
             self.policy = SchedulingPolicy.PRIORITY
@@ -177,6 +181,25 @@ class Scheduler(SchedulerInterface):
         )
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
 
+    def _adjust_tokens_for_streaming_prefill(self, request: Request,
+                                             num_new_tokens: int) -> int:
+        if (request.is_streaming_prefill
+                and not request.is_streaming_prefill_stopped):
+            uncomputed_prompt_tokens = (request.current_prompt_length -
+                                        request.num_computed_tokens)
+            if uncomputed_prompt_tokens >= 0:
+                max_prompt_to_compute = max(0,
+                                            request.current_prompt_length - 1)
+                num_new_tokens = max(
+                    0,
+                    min(num_new_tokens,
+                        max_prompt_to_compute - request.num_computed_tokens))
+        # print(request.prompt_token_ids, request.output_token_ids,
+        #       request.num_computed_tokens, request.current_prompt_length,
+        #       num_new_tokens, request.is_streaming_prefill, request.request_id
+        #       not in self.stopped_prefill_streams)
+        return num_new_tokens
+
     def schedule(self) -> SchedulerOutput:
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
@@ -206,6 +229,19 @@ class Scheduler(SchedulerInterface):
         # For logging.
         scheduled_timestamp = time.monotonic()
 
+        # Inject streamed prefill tokens into requests.
+        has_new_tokens = set()
+        for request_id, token_ids in list(self.prefill_streams.items()):
+            if token_ids and request_id in self.requests:
+                has_new_tokens.add(request_id)
+                request = self.requests[request_id]
+                request.add_streamed_prompt_tokens(token_ids)
+                self.prefill_streams[request_id] = []
+        for request_id in self.stopped_prefill_streams:
+            if request_id not in has_new_tokens and request_id in self.requests:
+                request = self.requests[request_id]
+                request.stop_prefill_streaming()
+
         # First, schedule the RUNNING requests.
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
@@ -214,6 +250,9 @@ class Scheduler(SchedulerInterface):
             num_new_tokens = (request.num_tokens_with_spec +
                               request.num_output_placeholders -
                               request.num_computed_tokens)
+            num_new_tokens = self._adjust_tokens_for_streaming_prefill(
+                request, num_new_tokens)
+
             if (0 < self.scheduler_config.long_prefill_token_threshold <
                     num_new_tokens):
                 num_new_tokens = (
@@ -424,6 +463,8 @@ class Scheduler(SchedulerInterface):
                     # `request.num_prompt_tokens` to consider the resumed
                     # requests, which have output tokens.
                     num_new_tokens = request.num_tokens - num_computed_tokens
+                    num_new_tokens = self._adjust_tokens_for_streaming_prefill(
+                        request, num_new_tokens)
                     if (0 < self.scheduler_config.long_prefill_token_threshold
                             < num_new_tokens):
                         num_new_tokens = (
@@ -673,6 +714,7 @@ class Scheduler(SchedulerInterface):
         new_block_ids: list[Optional[tuple[list[int], ...]]] = []
         num_computed_tokens: list[int] = []
         num_output_tokens: list[int] = []
+        prompt_token_ids: list[Optional[list[int]]] = []
 
         use_connector = self.connector is not None
         for req in itertools.chain(running_reqs, resumed_reqs):
@@ -698,6 +740,14 @@ class Scheduler(SchedulerInterface):
                 req_to_new_blocks[req_id].get_block_ids(allow_none=True))
             num_computed_tokens.append(req.num_computed_tokens)
             num_output_tokens.append(len(req.output_token_ids))
+
+            # For streaming prefill requests, send the current prompt_token_ids
+            # so the worker can update its cached state.
+            if (req.is_streaming_prefill
+                    and not req.is_streaming_prefill_stopped):
+                prompt_token_ids.append(req.prompt_token_ids)
+            else:
+                prompt_token_ids.append(None)
         # Because resumed_reqs is usually empty, it is more efficient to do
         # in-place appending so that we don't need to allocate a new list.
         resumed_from_preemption = [False] * len(running_reqs)
@@ -710,6 +760,7 @@ class Scheduler(SchedulerInterface):
             new_block_ids=new_block_ids,
             num_computed_tokens=num_computed_tokens,
             num_output_tokens=num_output_tokens,
+            prompt_token_ids=prompt_token_ids,
         )
 
     def _try_schedule_encoder_inputs(
@@ -1116,6 +1167,18 @@ class Scheduler(SchedulerInterface):
         if self.log_stats:
             request.record_event(EngineCoreEventType.QUEUED)
 
+    def stream_prefill_tokens(self, request_id: str,
+                              token_ids: list[int]) -> None:
+        if request_id not in self.requests or self.requests[
+                request_id].is_streaming_prefill_stopped:
+            return
+        if request_id not in self.prefill_streams:
+            self.prefill_streams[request_id] = []
+        self.prefill_streams[request_id].extend(token_ids)
+
+    def stop_prefill_stream(self, request_id: str) -> None:
+        self.stopped_prefill_streams.add(request_id)
+
     def finish_requests(
         self,
         request_ids: Union[str, Iterable[str]],
@@ -1172,6 +1235,10 @@ class Scheduler(SchedulerInterface):
 
         if not delay_free_blocks:
             self._free_blocks(request)
+
+        # Clean up streaming prefill data structures.
+        self.prefill_streams.pop(request_id, None)
+        self.stopped_prefill_streams.discard(request_id)
 
         return kv_xfer_params
 

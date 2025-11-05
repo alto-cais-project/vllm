@@ -243,6 +243,12 @@ class EngineCore:
 
         self.scheduler.add_request(request)
 
+    def stream_prefill_tokens(self, request_id: str, token_ids: list[int]):
+        self.scheduler.stream_prefill_tokens(request_id, token_ids)
+
+    def stop_prefill_stream(self, request_id: str):
+        self.scheduler.stop_prefill_stream(request_id)
+
     def abort_requests(self, request_ids: list[str]):
         """Abort requests from the scheduler."""
 

@@ -41,6 +41,7 @@ class Request:
         cache_salt: Optional[str] = None,
         priority: int = 0,
         trace_headers: Optional[Mapping[str, str]] = None,
+        streaming_prefill: Optional[bool] = None,
         block_hasher: Optional[Callable[["Request"],
                                         list["BlockHash"]]] = None,
     ) -> None:
@@ -95,6 +96,9 @@ class Request:
         self.num_computed_tokens = 0
         self.cache_salt: Optional[str] = cache_salt
 
+        self._streaming_prefill = streaming_prefill or False
+        self._streaming_prefill_stopped = False
+
         # Multi-modal related
         self.mm_features = mm_features or []
         self.num_encoder_inputs = len(self.mm_features)
@@ -147,6 +151,7 @@ class Request:
             cache_salt=request.cache_salt,
             priority=request.priority,
             trace_headers=request.trace_headers,
+            streaming_prefill=request.streaming_prefill,
             block_hasher=block_hasher,
         )
 
@@ -160,6 +165,14 @@ class Request:
         else:
             self._output_token_ids.extend(token_ids)
             self._all_token_ids.extend(token_ids)
+
+        if self.get_hash_new_full_blocks is not None:
+            self.block_hashes.extend(self.get_hash_new_full_blocks())
+
+    def add_streamed_prompt_tokens(self, token_ids: list[int]) -> None:
+        assert self.prompt_token_ids
+        self.prompt_token_ids.extend(token_ids)
+        self._all_token_ids.extend(token_ids)
 
         if self.get_hash_new_full_blocks is not None:
             self.block_hashes.extend(self.get_hash_new_full_blocks())
@@ -179,6 +192,22 @@ class Request:
     @property
     def num_output_tokens(self) -> int:
         return len(self._output_token_ids)
+
+    @property
+    def is_streaming_prefill(self) -> bool:
+        return self._streaming_prefill
+
+    @property
+    def current_prompt_length(self) -> int:
+        assert self.prompt_token_ids
+        return len(self.prompt_token_ids)
+
+    @property
+    def is_streaming_prefill_stopped(self) -> bool:
+        return self._streaming_prefill_stopped
+
+    def stop_prefill_streaming(self) -> None:
+        self._streaming_prefill_stopped = True
 
     def is_finished(self) -> bool:
         return RequestStatus.is_finished(self.status)
