@@ -13,7 +13,7 @@ from vllm.v1.engine.async_llm import AsyncLLM
 class StoryGenerator:
 
     def __init__(self, prompt: str):
-        engine_args = AsyncEngineArgs(model="facebook/opt-125m",
+        engine_args = AsyncEngineArgs(model="facebook/opt-6.7B",
                                       enforce_eager=True,
                                       gpu_memory_utilization=0.4)
 
@@ -39,7 +39,7 @@ class StoryGenerator:
 class StorySummarizer:
 
     def __init__(self):
-        engine_args = AsyncEngineArgs(model="facebook/opt-125m",
+        engine_args = AsyncEngineArgs(model="facebook/opt-6.7B",
                                       enforce_eager=True,
                                       gpu_memory_utilization=0.4)
 
@@ -54,11 +54,12 @@ class StorySummarizer:
 
         async def process_outputs(generator: AsyncGenerator[RequestOutput,
                                                             None]):
+            print("=" * 10, "Summary:")
             async for request_output in generator:
                 for output in request_output.outputs:
                     if output.text:
                         print(output.text, end="", flush=True)
-                if output.finished:
+                if request_output.finished:
                     print("\n✅ Generation complete!")
                     break
 
@@ -71,13 +72,20 @@ class StorySummarizer:
 
         output_task = asyncio.create_task(process_outputs(generator))
 
+        story_generator_output = ""
         async for request_output in story_generator.call():
             for output in request_output.outputs:
                 input_streamer.stream(output.text)
+                story_generator_output += output.text
+            if request_output.finished:
+                break
 
         input_streamer.end()
 
         await output_task
+
+        print("=" * 10, "Original story:")
+        print(story_generator_output)
 
     def __del__(self):
         self.engine.shutdown()
