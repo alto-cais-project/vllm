@@ -32,6 +32,9 @@ class StoryGenerator:
                                     sampling_params=self.sampling_params,
                                     request_id=request_id)
 
+    def __del__(self):
+        self.engine.shutdown()
+
 
 class StorySummarizer:
 
@@ -75,6 +78,9 @@ class StorySummarizer:
         input_streamer.end()
 
         await output_task
+
+    def __del__(self):
+        self.engine.shutdown()
 
 
 async def main():

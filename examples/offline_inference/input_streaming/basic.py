@@ -60,6 +60,8 @@ async def main():
     # Wait for output processing to complete
     await output_task
 
+    engine.shutdown()
+
     print("Streaming complete!")
 
 
