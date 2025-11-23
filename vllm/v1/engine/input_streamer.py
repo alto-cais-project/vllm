@@ -16,12 +16,12 @@ class InputStreamerAsync:
         self._tokenizer = tokenizer
         self._ended = False
 
-    def stream(self, text: str) -> None:
+    async def stream(self, text: str) -> None:
         assert not self._ended
         token_ids = self._tokenizer.encode(text, add_special_tokens=False)
-        self.stream_tokens(token_ids)
+        await self.stream_tokens(token_ids)
 
-    def stream_tokens(self, token_ids: list[int]) -> None:
+    async def stream_tokens(self, token_ids: list[int]) -> None:
         assert not self._ended
 
         if not token_ids:
@@ -30,11 +30,13 @@ class InputStreamerAsync:
         asyncio.create_task(
             self._engine_core.stream_prefill_tokens_async(
                 self.request_id, token_ids))
+        await asyncio.sleep(0)
 
-    def end(self) -> None:
+    async def end(self) -> None:
         assert not self._ended
 
         self._ended = True
 
         asyncio.create_task(
             self._engine_core.stop_prefill_stream_async(self.request_id))
+        await asyncio.sleep(0)
