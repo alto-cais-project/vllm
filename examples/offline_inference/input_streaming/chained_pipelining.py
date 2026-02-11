@@ -75,12 +75,12 @@ class StorySummarizer:
         story_generator_output = ""
         async for request_output in story_generator.call():
             for output in request_output.outputs:
-                input_streamer.stream(output.text)
+                await input_streamer.stream(output.text)
                 story_generator_output += output.text
             if request_output.finished:
                 break
 
-        input_streamer.end()
+        await input_streamer.end()
 
         await output_task
 

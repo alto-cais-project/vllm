@@ -45,17 +45,19 @@ async def main():
 
     # Stream additional prompt text dynamically
     # These can be called at any time, even while the model is processing
-    await asyncio.sleep(0.1)  # Simulate some delay
-    input_streamer.stream(" artificial")
+    await asyncio.sleep(0.8)  # Simulate some delay
+    print(f"Sending input chunk artificial")
+    await input_streamer.stream(" artificial")
 
-    await asyncio.sleep(0.1)
-    input_streamer.stream(" intelligence")
+    await asyncio.sleep(0.8)
+    print(f"Sending input chunk intelligence")
+    await input_streamer.stream(" intelligence")
 
-    await asyncio.sleep(0.1)
-    input_streamer.stream(" is")
+    await asyncio.sleep(0.5)
+    await input_streamer.stream(" is")
 
     # Signal that prompt streaming is complete
-    input_streamer.end()
+    await input_streamer.end()
 
     # Wait for output processing to complete
     await output_task
