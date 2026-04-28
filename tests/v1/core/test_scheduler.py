@@ -13,6 +13,7 @@ from vllm.multimodal.inputs import (MultiModalFeatureSpec,
                                     MultiModalKwargsItem, PlaceholderRange)
 from vllm.sampling_params import SamplingParams, StructuredOutputsParams
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
+from vllm.v1.core.sched.request_queue import AltoDRRRequestQueue
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.kv_cache_interface import (FullAttentionSpec, KVCacheConfig,
                                         KVCacheGroupSpec)
@@ -1336,6 +1337,141 @@ def create_requests_with_priority(
         )
         requests.append(request)
     return requests
+
+
+def create_alto_drr_request(
+    request_id: str,
+    flow_id: Optional[str] = None,
+    local_id: Optional[int] = None,
+    arrival_time: float = 0.0,
+    num_tokens: int = 10,
+) -> Request:
+    """Create a request with optional Alto ancestry DRR trace headers.
+
+    For ancestry [7, 3, 2], flow_id is the parent prefix "7/3" and
+    local_id is the current child id 2.
+    """
+    sampling_params = SamplingParams(ignore_eos=False, max_tokens=16)
+    trace_headers = None
+    if flow_id is not None or local_id is not None:
+        trace_headers = {}
+        if flow_id is not None:
+            trace_headers["alto-flow-id"] = flow_id
+        if local_id is not None:
+            trace_headers["alto-local-id"] = str(local_id)
+
+    return Request(
+        request_id=request_id,
+        prompt_token_ids=[0] * num_tokens,
+        sampling_params=sampling_params,
+        pooling_params=None,
+        eos_token_id=EOS_TOKEN_ID,
+        arrival_time=arrival_time,
+        trace_headers=trace_headers,
+    )
+
+
+def test_alto_drr_same_flow_orders_by_local_id():
+    queue = AltoDRRRequestQueue()
+    requests = [
+        create_alto_drr_request("child2", flow_id="7/3", local_id=2,
+                                arrival_time=2.0),
+        create_alto_drr_request("child0", flow_id="7/3", local_id=0,
+                                arrival_time=1.0),
+        create_alto_drr_request("child1", flow_id="7/3", local_id=1,
+                                arrival_time=0.0),
+    ]
+
+    for request in requests:
+        queue.add_request(request)
+
+    assert [queue.pop_request().request_id for _ in range(3)] == [
+        "child0", "child1", "child2"
+    ]
+
+
+def test_alto_drr_round_robins_across_flows():
+    queue = AltoDRRRequestQueue()
+    requests = [
+        create_alto_drr_request("7/3:0", flow_id="7/3", local_id=0,
+                                arrival_time=1.0),
+        create_alto_drr_request("7/3:1", flow_id="7/3", local_id=1,
+                                arrival_time=0.0),
+        create_alto_drr_request("7/4:0", flow_id="7/4", local_id=0,
+                                arrival_time=0.0),
+        create_alto_drr_request("7/4:1", flow_id="7/4", local_id=1,
+                                arrival_time=1.0),
+    ]
+
+    for request in requests:
+        queue.add_request(request)
+
+    assert [queue.pop_request().request_id for _ in range(4)] == [
+        "7/3:0", "7/4:0", "7/3:1", "7/4:1"
+    ]
+
+
+def test_alto_drr_missing_headers_use_default_flow():
+    queue = AltoDRRRequestQueue()
+    requests = [
+        create_alto_drr_request("2", arrival_time=2.0),
+        create_alto_drr_request("0", arrival_time=0.0),
+        create_alto_drr_request("1", arrival_time=1.0),
+    ]
+
+    for request in requests:
+        queue.add_request(request)
+
+    assert [queue.pop_request().request_id for _ in range(3)] == [
+        "0", "1", "2"
+    ]
+
+
+def test_alto_drr_one_layer_ancestry_uses_root_flow():
+    queue = AltoDRRRequestQueue()
+    requests = [
+        create_alto_drr_request("root7", flow_id="0", local_id=7,
+                                arrival_time=1.0),
+        create_alto_drr_request("root3", flow_id="0", local_id=3,
+                                arrival_time=0.0),
+    ]
+
+    for request in requests:
+        queue.add_request(request)
+
+    assert [queue.pop_request().request_id for _ in range(2)] == [
+        "root3", "root7"
+    ]
+
+
+def test_alto_drr_peek_then_pop_returns_same_request():
+    queue = AltoDRRRequestQueue()
+    queue.add_request(
+        create_alto_drr_request("7/3:0", flow_id="7/3", local_id=0,
+                                arrival_time=0.0))
+    queue.add_request(
+        create_alto_drr_request("7/4:0", flow_id="7/4", local_id=0,
+                                arrival_time=0.0))
+
+    peeked = queue.peek_request()
+    popped = queue.pop_request()
+
+    assert popped is peeked
+
+
+def test_alto_drr_remove_request_keeps_nonempty_flow_active():
+    queue = AltoDRRRequestQueue()
+    keep = create_alto_drr_request("keep", flow_id="7/3", local_id=0,
+                                   arrival_time=0.0)
+    remove = create_alto_drr_request("remove", flow_id="7/3", local_id=1,
+                                     arrival_time=1.0)
+
+    queue.add_request(keep)
+    queue.add_request(remove)
+    queue.remove_request(remove)
+
+    assert len(queue) == 1
+    assert queue.pop_request() is keep
 
 
 def test_priority_scheduling_basic_ordering():
