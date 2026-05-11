@@ -25,7 +25,7 @@ from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.sched.interface import SchedulerInterface
 from vllm.v1.core.sched.output import (CachedRequestData, NewRequestData,
                                        SchedulerOutput)
-from vllm.v1.core.sched.request_queue import (SchedulingPolicy,
+from vllm.v1.core.sched.request_queue import (AltoDRRRequestQueueV1, SchedulingPolicy,
                                               create_request_queue)
 from vllm.v1.core.sched.utils import check_stop, remove_all
 from vllm.v1.engine import (EngineCoreEventType, EngineCoreOutput,
@@ -124,6 +124,8 @@ class Scheduler(SchedulerInterface):
             self.policy = SchedulingPolicy.FCFS
         elif self.scheduler_config.policy == "alto_drr":
             self.policy = SchedulingPolicy.ALTO_DRR
+        elif self.scheduler_config.policy == "alto_drr_v1":
+            self.policy = SchedulingPolicy.ALTO_DRR_V1
         else:
             raise ValueError(
                 f"Unknown scheduling policy: {self.scheduler_config.policy}")
@@ -182,6 +184,41 @@ class Scheduler(SchedulerInterface):
             dcp_world_size=self.dcp_world_size,
         )
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
+
+    def _alto_root_token_quantum(self, token_budget: int) -> int:
+        """Return the per-root token quantum for ALTO DRR V1."""
+        assert isinstance(self.waiting, AltoDRRRequestQueueV1)
+
+        active_roots = max(1, self.waiting.num_active_roots())
+        fair_share = max(1, self.max_num_scheduled_tokens // active_roots)
+        return max(1, min(token_budget, fair_share))
+    
+    def _pop_waiting_request_without_accounting(
+    self,
+    expected_request: Request,
+    ) -> Request:
+        """Pop a skipped waiting request without charging ALTO fairness budget."""
+        if isinstance(self.waiting, AltoDRRRequestQueueV1):
+            return self.waiting.pop_request_without_accounting()
+        return self.waiting.pop_request()
+
+    def _pop_scheduled_waiting_request(
+    self,
+    num_new_tokens: int,
+    root_token_quantum: int | None,
+    token_budget: int,
+    ) -> Request:
+        """Pop a scheduled waiting request and charge its ALTO token cost."""
+        if isinstance(self.waiting, AltoDRRRequestQueueV1):
+            if root_token_quantum is None:
+                root_token_quantum = self._alto_root_token_quantum(token_budget)
+
+            return self.waiting.pop_request_and_account(
+                num_scheduled_tokens=num_new_tokens,
+                root_token_quantum=root_token_quantum,
+            )
+
+        return self.waiting.pop_request()
 
     def _adjust_tokens_for_streaming_prefill(self, request: Request,
                                              num_new_tokens: int) -> int:
@@ -382,6 +419,7 @@ class Scheduler(SchedulerInterface):
                     break
 
                 request = self.waiting.peek_request()
+                root_token_quantum: int | None = None
 
                 # KVTransfer: skip request if still waiting for remote kvs.
                 if request.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
@@ -392,7 +430,7 @@ class Scheduler(SchedulerInterface):
                         logger.debug(
                             "%s is still in WAITING_FOR_REMOTE_KVS state.",
                             request.request_id)
-                        self.waiting.pop_request()
+                        request = self._pop_waiting_request_without_accounting()
                         skipped_waiting_requests.prepend_request(request)
                         continue
 
@@ -403,7 +441,7 @@ class Scheduler(SchedulerInterface):
                     if structured_output_req and structured_output_req.grammar:
                         request.status = RequestStatus.WAITING
                     else:
-                        self.waiting.pop_request()
+                        request = self._pop_waiting_request_without_accounting()
                         skipped_waiting_requests.prepend_request(request)
                         continue
 
@@ -413,7 +451,7 @@ class Scheduler(SchedulerInterface):
                     (len(scheduled_loras) == self.lora_config.max_loras and
                      request.lora_request.lora_int_id not in scheduled_loras)):
                     # Scheduling would exceed max_loras, skip.
-                    self.waiting.pop_request()
+                    request = self._pop_waiting_request_without_accounting()
                     skipped_waiting_requests.prepend_request(request)
                     continue
 
@@ -437,7 +475,7 @@ class Scheduler(SchedulerInterface):
                             # The request cannot be scheduled because
                             # the KVConnector couldn't determine
                             # the number of matched tokens.
-                            self.waiting.pop_request()
+                            request = self._pop_waiting_request_without_accounting()
                             skipped_waiting_requests.prepend_request(request)
                             continue
 
@@ -476,11 +514,20 @@ class Scheduler(SchedulerInterface):
                     # pooling requests to be chunked
                     if not self.scheduler_config.chunked_prefill_enabled and \
                         num_new_tokens > token_budget:
-                        self.waiting.pop_request()
+                        request = self._pop_waiting_request_without_accounting()
                         skipped_waiting_requests.prepend_request(request)
                         continue
 
                     num_new_tokens = min(num_new_tokens, token_budget)
+
+                    if isinstance(self.waiting, AltoDRRRequestQueueV1):
+                        root_token_quantum = self._alto_root_token_quantum(token_budget)
+                        if self.scheduler_config.chunked_prefill_enabled:
+                            num_new_tokens = min(
+                                num_new_tokens,
+                                self.waiting.current_root_token_budget(root_token_quantum),
+                            )
+
                     assert num_new_tokens > 0
 
                     # Schedule encoder inputs.
@@ -541,14 +588,18 @@ class Scheduler(SchedulerInterface):
 
                 # Request was already popped from self.waiting
                 # unless it was re-added above due to new_blocks being None.
-                request = self.waiting.pop_request()
                 if load_kv_async:
                     # If loading async, allocate memory and put request
                     # into the WAITING_FOR_REMOTE_KV state.
+                    request = self._pop_waiting_request_without_accounting()
                     skipped_waiting_requests.prepend_request(request)
                     request.status = RequestStatus.WAITING_FOR_REMOTE_KVS
                     continue
-
+                request = self._pop_scheduled_waiting_request(
+                    num_new_tokens=num_new_tokens,
+                    root_token_quantum=root_token_quantum,
+                    token_budget=token_budget,
+                )
                 req_index += 1
                 self.running.append(request)
                 if self.log_stats:
