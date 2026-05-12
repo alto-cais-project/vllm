@@ -450,15 +450,23 @@ class AltoDRRRequestQueueV1(RequestQueue):
     @staticmethod
     def _parse_int(value: str | None, default: int = 0) -> int:
         """Parse an integer trace header value with a default fallback."""
+        if value is None:
+            return default
         return int(value)
+
+    @classmethod
+    def request_root_id(cls, request: Request) -> str:
+        """Extract Alto root id for root-level accounting."""
+        headers = request.trace_headers or {}
+        return headers.get("alto-root-id") or request.request_id
     
     def request_keys(self, request: Request) -> tuple[str, tuple[int, ...], int]:
         """Extract Alto root id, flow id, and local id for hierarchical DRR."""
         headers = request.trace_headers or {}
 
-        root_id = headers["alto-root-id"]
-        flow_id = headers["alto-flow-id"]
-        local_id = self._parse_int(headers["alto-local-id"])
+        root_id = self.request_root_id(request)
+        flow_id = headers.get("alto-flow-id") or self.ROOT_FLOW
+        local_id = self._parse_int(headers.get("alto-local-id"))
 
         return root_id, self._parse_flow_rank(flow_id), local_id
     
@@ -475,6 +483,10 @@ class AltoDRRRequestQueueV1(RequestQueue):
 
     def num_active_roots(self) -> int:
         return len(self._active_roots)
+
+    def active_root_ids(self) -> set[str]:
+        """Return root ids that currently have waiting requests."""
+        return set(self._active_roots)
     
     def activate_root(self, root_id: str) -> None:
         """Create and activate a root so it participates in round-robin."""
@@ -526,12 +538,57 @@ class AltoDRRRequestQueueV1(RequestQueue):
         self._cached_root = root_id
         self._cached_request = request
         return root_id, request
+
+    def peek_root_id(self) -> str:
+        """Peek at the selected request's root id without removing it."""
+        root_id, _ = self.select_request()
+        return root_id
     
     def current_root_token_budget(self, root_token_quantum: int) -> int:
         """Return the remaining token budget for the selected root."""
         root_id, _ = self.select_request()
+        return self.root_token_budget(root_id, root_token_quantum)
+
+    def root_token_budget(self, root_id: str,
+                          root_token_quantum: int) -> int:
+        """Return the remaining token budget for a root."""
         used = self._root_tokens_used.get(root_id, 0)
-        return max(1, max(1, root_token_quantum) - used)
+        return max(0, max(1, root_token_quantum) - used)
+
+    def reset_root_budget(self, root_id: str) -> None:
+        """Reset a root's accumulated token usage."""
+        self._root_tokens_used[root_id] = 0
+
+    def defer_current_root(self) -> bool:
+        """Move the current waiting root behind other active waiting roots."""
+        root_id = self.fetch_next_live_root()
+        if root_id is None or len(self._active_roots) <= 1:
+            return False
+
+        self._root_tokens_used[root_id] = 0
+        self._root_order.rotate(-1)
+        self.clear_cache()
+        return True
+
+    def account_root_tokens(self, root_id: str, num_scheduled_tokens: int,
+                            root_token_quantum: int) -> None:
+        """Charge scheduled prefill tokens to a root's monopoly cap."""
+        quantum = max(1, root_token_quantum)
+        used = self._root_tokens_used.get(root_id, 0)
+        used += max(0, num_scheduled_tokens)
+
+        if used < quantum:
+            self._root_tokens_used[root_id] = used
+            return
+
+        self._root_tokens_used[root_id] = quantum
+
+        if root_id in self._active_roots:
+            current_root = self.fetch_next_live_root()
+            if current_root == root_id and len(self._active_roots) > 1:
+                self._root_tokens_used[root_id] = 0
+                self._root_order.rotate(-1)
+                self.clear_cache()
     
     def add_request(self, request: Request) -> None:
         """Add a request into its root heap using ancestry order."""
@@ -564,17 +621,9 @@ class AltoDRRRequestQueueV1(RequestQueue):
     def pop_request_and_account(self, num_scheduled_tokens: int,
                                 root_token_quantum: int) -> Request:
         """Pop a scheduled request and account its token cost to the root."""
-        root_id, request, has_remaining_requests = self._pop_selected_request()
-        if not has_remaining_requests:
-            return request
-        
-        quantum = max(1, root_token_quantum)
-        self._root_tokens_used[root_id] += max(0, num_scheduled_tokens)
-
-        if self._root_tokens_used[root_id] >= quantum:
-            self._root_tokens_used[root_id] = 0
-            self._root_order.rotate(-1)
-
+        root_id, request, _ = self._pop_selected_request()
+        self.account_root_tokens(root_id, num_scheduled_tokens,
+                                 root_token_quantum)
         return request
 
     def pop_request(self) -> Request:

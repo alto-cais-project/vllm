@@ -185,39 +185,32 @@ class Scheduler(SchedulerInterface):
         )
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
 
-    def _alto_root_token_quantum(self, token_budget: int) -> int:
-        """Return the per-root token quantum for ALTO DRR V1."""
+    def _alto_root_token_quantum(self) -> int:
+        """Return the per-root token cap for ALTO Scheduling."""
+        # TODO: Taking 2 for default, ideally wants a user input of this multiplier.
         assert isinstance(self.waiting, AltoDRRRequestQueueV1)
 
-        active_roots = max(1, self.waiting.num_active_roots())
-        fair_share = max(1, self.max_num_scheduled_tokens // active_roots)
-        return max(1, min(token_budget, fair_share))
+        return max(1, 2 * self.max_num_scheduled_tokens)
+
+    def _alto_v1_has_other_prefill_root(self, root_id: str) -> bool:
+        """Return whether another root has prefill work to make progress on."""
+        assert isinstance(self.waiting, AltoDRRRequestQueueV1)
+
+        if any(active_root_id != root_id
+               for active_root_id in self.waiting.active_root_ids()):
+            return True
+
+        return any(
+            request.num_computed_tokens < request.num_prompt_tokens
+            and AltoDRRRequestQueueV1.request_root_id(request) != root_id
+            for request in self.running)
     
     def _pop_waiting_request_without_accounting(
     self,
-    expected_request: Request,
     ) -> Request:
         """Pop a skipped waiting request without charging ALTO fairness budget."""
         if isinstance(self.waiting, AltoDRRRequestQueueV1):
             return self.waiting.pop_request_without_accounting()
-        return self.waiting.pop_request()
-
-    def _pop_scheduled_waiting_request(
-    self,
-    num_new_tokens: int,
-    root_token_quantum: int | None,
-    token_budget: int,
-    ) -> Request:
-        """Pop a scheduled waiting request and charge its ALTO token cost."""
-        if isinstance(self.waiting, AltoDRRRequestQueueV1):
-            if root_token_quantum is None:
-                root_token_quantum = self._alto_root_token_quantum(token_budget)
-
-            return self.waiting.pop_request_and_account(
-                num_scheduled_tokens=num_new_tokens,
-                root_token_quantum=root_token_quantum,
-            )
-
         return self.waiting.pop_request()
 
     def _adjust_tokens_for_streaming_prefill(self, request: Request,
@@ -259,6 +252,7 @@ class Scheduler(SchedulerInterface):
         req_to_new_blocks: dict[str, KVCacheBlocks] = {}
         num_scheduled_tokens: dict[str, int] = {}
         token_budget = self.max_num_scheduled_tokens
+        alto_v1_deferred_roots: set[str] = set()
         # Encoder-related.
         scheduled_encoder_inputs: dict[str, list[int]] = {}
         encoder_compute_budget = self.max_num_encoder_input_tokens
@@ -303,6 +297,34 @@ class Scheduler(SchedulerInterface):
             num_new_tokens = min(
                 num_new_tokens,
                 self.max_model_len - 1 - request.num_computed_tokens)
+
+            alto_v1_root_id: str | None = None
+            alto_v1_root_quantum: int | None = None
+            alto_v1_root_quota_left: int | None = None
+            if (isinstance(self.waiting, AltoDRRRequestQueueV1)
+                    and request.num_computed_tokens < request.num_prompt_tokens):
+                alto_v1_root_id = AltoDRRRequestQueueV1.request_root_id(request)
+                alto_v1_root_quantum = self._alto_root_token_quantum()
+
+                if alto_v1_root_id in alto_v1_deferred_roots:
+                    req_index += 1
+                    continue
+
+                alto_v1_root_quota_left = self.waiting.root_token_budget(
+                    alto_v1_root_id, alto_v1_root_quantum)
+                if alto_v1_root_quota_left == 0:
+                    if self._alto_v1_has_other_prefill_root(alto_v1_root_id):
+                        alto_v1_deferred_roots.add(alto_v1_root_id)
+                        self.waiting.reset_root_budget(alto_v1_root_id)
+                        req_index += 1
+                        continue
+
+                    self.waiting.reset_root_budget(alto_v1_root_id)
+                    alto_v1_root_quota_left = self.waiting.root_token_budget(
+                        alto_v1_root_id, alto_v1_root_quantum)
+
+                num_new_tokens = min(num_new_tokens,
+                                     alto_v1_root_quota_left)
 
             # Schedule encoder inputs.
             encoder_inputs_to_schedule = None
@@ -378,6 +400,14 @@ class Scheduler(SchedulerInterface):
             req_to_new_blocks[request.request_id] = new_blocks
             num_scheduled_tokens[request.request_id] = num_new_tokens
             token_budget -= num_new_tokens
+            if alto_v1_root_id is not None:
+                assert alto_v1_root_quantum is not None
+                self.waiting.account_root_tokens(alto_v1_root_id,
+                                                 num_new_tokens,
+                                                 alto_v1_root_quantum)
+                if (alto_v1_root_quota_left is not None
+                        and num_new_tokens >= alto_v1_root_quota_left):
+                    alto_v1_deferred_roots.add(alto_v1_root_id)
             req_index += 1
 
             # Speculative decode related.
@@ -521,12 +551,29 @@ class Scheduler(SchedulerInterface):
                     num_new_tokens = min(num_new_tokens, token_budget)
 
                     if isinstance(self.waiting, AltoDRRRequestQueueV1):
-                        root_token_quantum = self._alto_root_token_quantum(token_budget)
+                        root_token_quantum = self._alto_root_token_quantum()
+                        root_id = self.waiting.peek_root_id()
+                        if root_id in alto_v1_deferred_roots:
+                            if self.waiting.defer_current_root():
+                                continue
+                            if self._alto_v1_has_other_prefill_root(root_id):
+                                break
+                            self.waiting.reset_root_budget(root_id)
+                            alto_v1_deferred_roots.discard(root_id)
+                        root_quota_left = self.waiting.current_root_token_budget(
+                            root_token_quantum)
+                        if root_quota_left == 0:
+                            if self._alto_v1_has_other_prefill_root(root_id):
+                                alto_v1_deferred_roots.add(root_id)
+                                if self.waiting.defer_current_root():
+                                    continue
+                                break
+
+                            self.waiting.reset_root_budget(root_id)
+                            root_quota_left = self.waiting.current_root_token_budget(
+                                root_token_quantum)
                         if self.scheduler_config.chunked_prefill_enabled:
-                            num_new_tokens = min(
-                                num_new_tokens,
-                                self.waiting.current_root_token_budget(root_token_quantum),
-                            )
+                            num_new_tokens = min(num_new_tokens, root_quota_left)
 
                     assert num_new_tokens > 0
 
@@ -595,11 +642,15 @@ class Scheduler(SchedulerInterface):
                     skipped_waiting_requests.prepend_request(request)
                     request.status = RequestStatus.WAITING_FOR_REMOTE_KVS
                     continue
-                request = self._pop_scheduled_waiting_request(
-                    num_new_tokens=num_new_tokens,
-                    root_token_quantum=root_token_quantum,
-                    token_budget=token_budget,
-                )
+                if isinstance(self.waiting, AltoDRRRequestQueueV1):
+                    if root_token_quantum is None:
+                        root_token_quantum = self._alto_root_token_quantum()
+                    request = self.waiting.pop_request_and_account(
+                        num_scheduled_tokens=num_new_tokens,
+                        root_token_quantum=root_token_quantum,
+                    )
+                else:
+                    request = self.waiting.pop_request()
                 req_index += 1
                 self.running.append(request)
                 if self.log_stats:
