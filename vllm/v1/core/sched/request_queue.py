@@ -16,8 +16,7 @@ class SchedulingPolicy(Enum):
     """Enum for scheduling policies."""
     FCFS = "fcfs"
     PRIORITY = "priority"
-    ALTO_DRR = "alto_drr"
-    ALTO_DRR_V1 = "alto_drr_v1"
+    ALTO = "alto"
 
 
 class RequestQueue(ABC):
@@ -215,213 +214,10 @@ class PriorityRequestQueue(RequestQueue):
         """Iterate over the queue in reverse priority order."""
         return reversed(list(self))
 
-class AltoDRRRequestQueue(RequestQueue):
+    
+class AltoRequestQueue(RequestQueue):
     """
-    Alto ancestry-aware DRR queue V0.
-
-    - Flow key comes from x-alto-flow-id.
-    - Local ordering inside a flow uses alto-local-id.
-    - Cross-flow scheduling is one request per active flow per round.
-    """
-    DEFAULT_FLOW = "__default__"
-    QUANTUM = 1
-    COST = 1
-
-    def __init__(self) -> None:
-        self._flows: dict[str, list[tuple[int, float, Request]]] = {}
-        self._flow_order: deque[str] = deque()
-        self._active_flows: set[str] = set()
-        self._deficit: dict[str, int] = {}
-        self._size = 0
-
-        self._cached_flow: str | None = None
-        self._cached_request: Request | None = None
-
-    @staticmethod
-    def _parse_int(value: str | None, default: int = 0) -> int:
-        """Parse an integer trace header value with a default fallback."""
-        if value is None:
-            return default
-        return int(value)
-        
-    def clear_cache(self) -> None:
-        """Clear the cached peek candidate after any queue mutation."""
-        self._cached_flow = None
-        self._cached_request = None
-
-    def request_keys(self, request: Request) -> tuple[str, int]:
-        """Extract the Alto flow id and local id used for DRR ordering."""
-        headers = request.trace_headers or {}
-
-        flow_id = headers.get("alto-flow-id") or self.DEFAULT_FLOW
-        local_id = self._parse_int(headers.get("alto-local-id"))
-
-        return flow_id, local_id
-    
-    def activate_flow(self, flow_id: str) -> None:
-        """Create and activate a flow so it participates in round-robin."""
-        if flow_id not in self._flows:
-            self._flows[flow_id] = []
-        if flow_id not in self._active_flows:
-            self._active_flows.add(flow_id)
-            self._flow_order.append(flow_id)
-            self._deficit.setdefault(flow_id, 0)
-    
-    def remove_flow_if_empty(self, flow_id: str) -> None:
-        """Remove an empty flow while avoiding O(n) deque removal."""
-        if self._flows.get(flow_id):
-            return
-
-        self._flows.pop(flow_id, None)
-        self._active_flows.discard(flow_id)
-        self._deficit.pop(flow_id, None)
-
-        if self._flow_order and self._flow_order[0] == flow_id:
-            self._flow_order.popleft()
-    
-    def fetch_next_live_flow(self) -> str | None:
-        """Return the next active non-empty flow, lazily dropping stale ones."""
-        while self._flow_order:
-            flow_id = self._flow_order[0]
-            if flow_id in self._active_flows and self._flows.get(flow_id):
-                return flow_id
-            self._flow_order.popleft()
-        return None
-    
-    def select_request(self) -> tuple[str, Request]:
-        """Select and cache the next request without removing it."""
-        if self._cached_flow is not None and self._cached_request is not None:
-            return self._cached_flow, self._cached_request
-
-        flow_id = self.fetch_next_live_flow()
-        if flow_id is None:
-            raise IndexError("peek from an empty AltoDRRRequestQueue")
-
-        self._deficit[flow_id] = self._deficit.get(flow_id, 0) + self.QUANTUM
-
-        heap = self._flows[flow_id]
-        _,_,request = heap[0]
-
-        self._cached_flow = flow_id
-        self._cached_request = request
-        return flow_id, request
-    
-    def add_request(self, request: Request) -> None:
-        """Add a request to the queue according to DRR policy."""
-        flow_id, local_id = self.request_keys(request)
-        self.activate_flow(flow_id)
-
-        heapq.heappush(self._flows[flow_id],
-                       (local_id, request.arrival_time, request))
-        self._size += 1
-        self.clear_cache()
-
-    def pop_request(self) -> Request:
-        """Pop a request and advance the flow rotation."""
-        flow_id, cached_request = self.select_request()
-        heap = self._flows[flow_id]
-        _, _, request = heapq.heappop(heap)
-        assert request == cached_request
-        self._size -= 1
-        self._deficit[flow_id] = max(
-            0, self._deficit.get(flow_id, 0) - self.COST
-        )
-        self.clear_cache()
-
-        if heap:
-            self._flow_order.rotate(-1)
-        else:
-            self.remove_flow_if_empty(flow_id)
-
-        return request
-
-
-    def peek_request(self) -> Request:
-        """Peek at the next request in the queue without removing it."""
-        _, request = self.select_request()
-        return request
-    
-    def prepend_request(self, request: Request) -> None:
-        """Add a request to the queue according to DRR policy.
-        
-        DRR has no literal front of queue because requests are grouped by flow."""
-        self.add_request(request)
-
-    def prepend_requests(self, requests: RequestQueue) -> None:
-        """Add all requests from another queue according to DRR policy.
-        Used when skipped or preempted requests return to the waiting queue."""
-        for request in requests:
-            self.add_request(request)
-
-    def remove_request(self, request: Request) -> None:
-        """Remove a specific request from the queue."""
-        self.clear_cache()
-        for flow_id, heap in list(self._flows.items()):
-            new_heap = [(o, t, r) for (o, t, r) in heap if r != request]
-            removed = len(heap) - len(new_heap)
-            if removed == 0:
-                continue
-        
-            heapq.heapify(new_heap)
-            self._flows[flow_id] = new_heap
-            self._size -= removed
-            self.remove_flow_if_empty(flow_id)
-
-    def remove_requests(self, requests: Iterable[Request]) -> None:
-        """Remove multiple specific requests across all active Alto flows."""
-        self.clear_cache()
-
-        requests_to_remove = set(requests)
-        for flow_id, heap in list(self._flows.items()):
-            new_heap = [(o, t, r) for (o, t, r) in heap if r not in requests_to_remove]
-            removed = len(heap) - len(new_heap)
-            if removed == 0:
-                continue
-        
-            heapq.heapify(new_heap)
-            self._flows[flow_id] = new_heap
-            self._size -= removed
-            self.remove_flow_if_empty(flow_id)
-
-
-    def __bool__(self) -> bool:
-        """Return whether any flow currently has waiting requests."""
-        return self._size > 0
-
-    def __len__(self) -> int:
-        """Return the total number of requests across all flows."""
-        return self._size
-
-    def __iter__(self) -> Iterator[Request]:
-        """Iterate over requests in DRR order without mutating the queue."""
-        flow_order = deque(
-            flow_id for flow_id in self._flow_order
-            if flow_id in self._active_flows and self._flows.get(flow_id)
-        )
-        flows = {
-            flow_id: heap[:]
-            for flow_id, heap in self._flows.items()
-            if flow_id in self._active_flows and heap
-        }
-        while flow_order:
-            flow_id = flow_order.popleft()
-            heap = flows.get(flow_id)
-            if not heap:
-                continue
-
-            _, _, request = heapq.heappop(heap)
-            yield request
-
-            if heap:
-                flow_order.append(flow_id)
-
-    def __reversed__(self) -> Iterator[Request]:
-        """Iterate over the current DRR order in reverse."""
-        return reversed(list(self))
-    
-class AltoDRRRequestQueueV1(RequestQueue):
-    """
-    Alto ancestry-aware root-level DRR queue.
+    Alto ancestry-aware root-level queue.
 
     Required trace headers:
     - alto-root-id: root request/tree id
@@ -436,40 +232,41 @@ class AltoDRRRequestQueueV1(RequestQueue):
 
     def __init__(self) -> None:
         self._roots: dict[
-            str, list[tuple[tuple[int, ...], int, float, Request]]
+            int, list[tuple[tuple[int, ...], int, float, Request]]
         ] = {}
-        self._root_order: deque[tuple[str, int]] = deque()
-        self._active_roots: set[str] = set()
-        self._root_epochs: dict[str, int] = {}
-        self._root_tokens_used: dict[str, int] = {}
+        self._root_order: deque[tuple[int, int]] = deque()
+        self._active_roots: set[int] = set()
+        self._root_epochs: dict[int, int] = {}
+        self._root_tokens_used: dict[int, int] = {}
         self._size = 0
 
-        self._cached_root: str | None = None
+        self._cached_root: int | None = None
         self._cached_request: Request | None = None
 
     @staticmethod
-    def _parse_int(value: str | None, default: int = 0) -> int:
-        """Parse an integer trace header value with a default fallback."""
+    def _parse_int(value: str | None) -> int:
+        """Parse a required integer trace header value."""
         if value is None:
-            return default
+            raise ValueError("Missing required ALTO integer trace header")
         return int(value)
-
-    @classmethod
-    def request_root_id(cls, request: Request) -> str:
-        """Extract Alto root id for root-level accounting."""
-        headers = request.trace_headers or {}
-        return headers.get("alto-root-id") or request.request_id
     
-    def request_keys(self, request: Request) -> tuple[str, tuple[int, ...], int]:
+    def request_keys(self, request: Request) -> tuple[int, tuple[int, ...], int]:
         """Extract Alto root id, flow id, and local id for hierarchical DRR."""
         headers = request.trace_headers or {}
 
-        root_id = self.request_root_id(request)
+        root_id = self._parse_int(headers.get("alto-root-id"))
         flow_id = headers.get("alto-flow-id") or self.ROOT_FLOW
         local_id = self._parse_int(headers.get("alto-local-id"))
 
         return root_id, self._parse_flow_rank(flow_id), local_id
     
+    @staticmethod
+    def request_root_id(request: Request) -> int:
+        headers = request.trace_headers or {}
+        root_id = headers.get("alto-root-id")
+        if root_id is None:
+            raise ValueError("Missing required ALTO root trace header")
+        return int(root_id)
     @classmethod
     def _parse_flow_rank(cls, flow_id: str) -> tuple[int, ...]:
         if flow_id in ("", "0", cls.ROOT_FLOW):
@@ -484,11 +281,16 @@ class AltoDRRRequestQueueV1(RequestQueue):
     def num_active_roots(self) -> int:
         return len(self._active_roots)
 
-    def active_root_ids(self) -> set[str]:
+    def active_root_ids(self) -> set[int]:
         """Return root ids that currently have waiting requests."""
         return set(self._active_roots)
     
-    def activate_root(self, root_id: str) -> None:
+    def has_other_active_root(self, root_id: int) -> bool:
+        if len(self._active_roots) > 1:
+            return True
+        return bool(self._active_roots) and root_id not in self._active_roots
+    
+    def activate_root(self, root_id: int) -> None:
         """Create and activate a root so it participates in round-robin."""
         if root_id not in self._roots:
             self._roots[root_id] = []
@@ -500,7 +302,7 @@ class AltoDRRRequestQueueV1(RequestQueue):
             self._root_order.append((root_id, epoch))
             self._root_tokens_used.setdefault(root_id, 0)
     
-    def remove_root_if_empty(self, root_id: str) -> None:
+    def remove_root_if_empty(self, root_id: int) -> None:
         """Deactivate an empty root while keeping root-order cleanup lazy."""
         if self._roots.get(root_id):
             return
@@ -509,13 +311,13 @@ class AltoDRRRequestQueueV1(RequestQueue):
         self._active_roots.discard(root_id)
         self._root_tokens_used.pop(root_id, None)
 
-    def _is_live_root_entry(self, root_id: str, epoch: int) -> bool:
+    def _is_live_root_entry(self, root_id: int, epoch: int) -> bool:
         """Return whether a root-order entry is still valid."""
         return (root_id in self._active_roots
                 and self._root_epochs.get(root_id) == epoch
                 and bool(self._roots.get(root_id)))
     
-    def fetch_next_live_root(self) -> str | None:
+    def fetch_next_live_root(self) -> int | None:
         """Return the next active non-empty root, lazily dropping stale entries."""
         while self._root_order:
             root_id, epoch = self._root_order[0]
@@ -524,14 +326,14 @@ class AltoDRRRequestQueueV1(RequestQueue):
             self._root_order.popleft()
         return None
     
-    def select_request(self) -> tuple[str, Request]:
+    def select_request(self) -> tuple[int, Request]:
         """Select and cache the next request without removing it."""
         if self._cached_root is not None and self._cached_request is not None:
             return self._cached_root, self._cached_request
 
         root_id = self.fetch_next_live_root()
         if root_id is None:
-            raise IndexError("peek from an empty AltoDRRRequestQueueV1")
+            raise IndexError("peek from an empty AltoRequestQueue")
 
         _, _, _, request = self._roots[root_id][0]
 
@@ -539,7 +341,7 @@ class AltoDRRRequestQueueV1(RequestQueue):
         self._cached_request = request
         return root_id, request
 
-    def peek_root_id(self) -> str:
+    def peek_root_id(self) -> int:
         """Peek at the selected request's root id without removing it."""
         root_id, _ = self.select_request()
         return root_id
@@ -549,13 +351,13 @@ class AltoDRRRequestQueueV1(RequestQueue):
         root_id, _ = self.select_request()
         return self.root_token_budget(root_id, root_token_quantum)
 
-    def root_token_budget(self, root_id: str,
+    def root_token_budget(self, root_id: int,
                           root_token_quantum: int) -> int:
         """Return the remaining token budget for a root."""
         used = self._root_tokens_used.get(root_id, 0)
         return max(0, max(1, root_token_quantum) - used)
 
-    def reset_root_budget(self, root_id: str) -> None:
+    def reset_root_budget(self, root_id: int) -> None:
         """Reset a root's accumulated token usage."""
         self._root_tokens_used[root_id] = 0
 
@@ -570,7 +372,7 @@ class AltoDRRRequestQueueV1(RequestQueue):
         self.clear_cache()
         return True
 
-    def account_root_tokens(self, root_id: str, num_scheduled_tokens: int,
+    def account_root_tokens(self, root_id: int, num_scheduled_tokens: int,
                             root_token_quantum: int) -> None:
         """Charge scheduled prefill tokens to a root's monopoly cap."""
         quantum = max(1, root_token_quantum)
@@ -600,7 +402,7 @@ class AltoDRRRequestQueueV1(RequestQueue):
         self._size += 1
         self.clear_cache()
 
-    def _pop_selected_request(self) -> tuple[str, Request, bool]:
+    def _pop_selected_request(self) -> tuple[int, Request, bool]:
         root_id, cached_request = self.select_request()
         _, _, _, request = heapq.heappop(self._roots[root_id])
         assert request == cached_request
@@ -665,6 +467,11 @@ class AltoDRRRequestQueueV1(RequestQueue):
             self._size -= removed
             self.remove_root_if_empty(root_id)
 
+    def prune_root_budgets(self, live_root_ids: set[int]) -> None:
+        """Drop token budget state for roots with no active prefill work."""
+        for root_id in list(self._root_tokens_used):
+            if root_id not in live_root_ids:
+                self._root_tokens_used.pop(root_id, None)
 
     def __bool__(self) -> bool:
         """Return whether any root currently has waiting requests."""
@@ -707,9 +514,7 @@ def create_request_queue(policy: SchedulingPolicy) -> RequestQueue:
         return PriorityRequestQueue()
     elif policy == SchedulingPolicy.FCFS:
         return FCFSRequestQueue()
-    elif policy == SchedulingPolicy.ALTO_DRR:
-        return AltoDRRRequestQueue()
-    elif policy == SchedulingPolicy.ALTO_DRR_V1:
-        return AltoDRRRequestQueueV1()
+    elif policy == SchedulingPolicy.ALTO:
+        return AltoRequestQueue()
     else:
         raise ValueError(f"Unknown scheduling policy: {policy}")

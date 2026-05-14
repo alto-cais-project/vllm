@@ -25,7 +25,8 @@ from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.sched.interface import SchedulerInterface
 from vllm.v1.core.sched.output import (CachedRequestData, NewRequestData,
                                        SchedulerOutput)
-from vllm.v1.core.sched.request_queue import (AltoDRRRequestQueueV1, SchedulingPolicy,
+from vllm.v1.core.sched.request_queue import (AltoRequestQueue,
+                                              SchedulingPolicy,
                                               create_request_queue)
 from vllm.v1.core.sched.utils import check_stop, remove_all
 from vllm.v1.engine import (EngineCoreEventType, EngineCoreOutput,
@@ -122,10 +123,8 @@ class Scheduler(SchedulerInterface):
             self.policy = SchedulingPolicy.PRIORITY
         elif self.scheduler_config.policy == "fcfs":
             self.policy = SchedulingPolicy.FCFS
-        elif self.scheduler_config.policy == "alto_drr":
-            self.policy = SchedulingPolicy.ALTO_DRR
-        elif self.scheduler_config.policy == "alto_drr_v1":
-            self.policy = SchedulingPolicy.ALTO_DRR_V1
+        elif self.scheduler_config.policy == "alto":
+            self.policy = SchedulingPolicy.ALTO
         else:
             raise ValueError(
                 f"Unknown scheduling policy: {self.scheduler_config.policy}")
@@ -188,28 +187,38 @@ class Scheduler(SchedulerInterface):
     def _alto_root_token_quantum(self) -> int:
         """Return the per-root token cap for ALTO Scheduling."""
         # TODO: Taking 2 for default, ideally wants a user input of this multiplier.
-        assert isinstance(self.waiting, AltoDRRRequestQueueV1)
+        return max(1, self.max_num_scheduled_tokens // 2)
 
-        return max(1, 2 * self.max_num_scheduled_tokens)
+    def _alto_request_root_id(self, request: Request) -> int:
+        return AltoRequestQueue.request_root_id(request)
 
-    def _alto_v1_has_other_prefill_root(self, root_id: str) -> bool:
+    def _alto_has_other_prefill_root(self, root_id: int) -> bool:
         """Return whether another root has prefill work to make progress on."""
-        assert isinstance(self.waiting, AltoDRRRequestQueueV1)
-
-        if any(active_root_id != root_id
-               for active_root_id in self.waiting.active_root_ids()):
+        if self.waiting.has_other_active_root(root_id):
             return True
 
         return any(
             request.num_computed_tokens < request.num_prompt_tokens
-            and AltoDRRRequestQueueV1.request_root_id(request) != root_id
+            and self._alto_request_root_id(request) != root_id
             for request in self.running)
+
+    def _alto_prune_inactive_root_budgets(self) -> None:
+        """Drop ALTO budget state for roots without waiting/running prefill."""
+        if not isinstance(self.waiting, AltoRequestQueue):
+            return
+
+        live_root_ids = self.waiting.active_root_ids()
+        for request in self.running:
+            if request.num_computed_tokens < request.num_prompt_tokens:
+                live_root_ids.add(self._alto_request_root_id(request))
+
+        self.waiting.prune_root_budgets(live_root_ids)
     
     def _pop_waiting_request_without_accounting(
     self,
     ) -> Request:
         """Pop a skipped waiting request without charging ALTO fairness budget."""
-        if isinstance(self.waiting, AltoDRRRequestQueueV1):
+        if isinstance(self.waiting, AltoRequestQueue):
             return self.waiting.pop_request_without_accounting()
         return self.waiting.pop_request()
 
@@ -252,7 +261,7 @@ class Scheduler(SchedulerInterface):
         req_to_new_blocks: dict[str, KVCacheBlocks] = {}
         num_scheduled_tokens: dict[str, int] = {}
         token_budget = self.max_num_scheduled_tokens
-        alto_v1_deferred_roots: set[str] = set()
+        alto_deferred_roots: set[int] = set()
         # Encoder-related.
         scheduled_encoder_inputs: dict[str, list[int]] = {}
         encoder_compute_budget = self.max_num_encoder_input_tokens
@@ -298,33 +307,33 @@ class Scheduler(SchedulerInterface):
                 num_new_tokens,
                 self.max_model_len - 1 - request.num_computed_tokens)
 
-            alto_v1_root_id: str | None = None
-            alto_v1_root_quantum: int | None = None
-            alto_v1_root_quota_left: int | None = None
-            if (isinstance(self.waiting, AltoDRRRequestQueueV1)
+            alto_root_id: int | None = None
+            alto_root_quantum: int | None = None
+            alto_root_quota_left: int | None = None
+            if (isinstance(self.waiting, AltoRequestQueue)
                     and request.num_computed_tokens < request.num_prompt_tokens):
-                alto_v1_root_id = AltoDRRRequestQueueV1.request_root_id(request)
-                alto_v1_root_quantum = self._alto_root_token_quantum()
+                alto_root_id = self._alto_request_root_id(request)
+                alto_root_quantum = self._alto_root_token_quantum()
 
-                if alto_v1_root_id in alto_v1_deferred_roots:
+                if alto_root_id in alto_deferred_roots:
                     req_index += 1
                     continue
 
-                alto_v1_root_quota_left = self.waiting.root_token_budget(
-                    alto_v1_root_id, alto_v1_root_quantum)
-                if alto_v1_root_quota_left == 0:
-                    if self._alto_v1_has_other_prefill_root(alto_v1_root_id):
-                        alto_v1_deferred_roots.add(alto_v1_root_id)
-                        self.waiting.reset_root_budget(alto_v1_root_id)
+                alto_root_quota_left = self.waiting.root_token_budget(
+                    alto_root_id, alto_root_quantum)
+                if alto_root_quota_left == 0:
+                    if self._alto_has_other_prefill_root(alto_root_id):
+                        alto_deferred_roots.add(alto_root_id)
+                        self.waiting.reset_root_budget(alto_root_id)
                         req_index += 1
                         continue
 
-                    self.waiting.reset_root_budget(alto_v1_root_id)
-                    alto_v1_root_quota_left = self.waiting.root_token_budget(
-                        alto_v1_root_id, alto_v1_root_quantum)
+                    self.waiting.reset_root_budget(alto_root_id)
+                    alto_root_quota_left = self.waiting.root_token_budget(
+                        alto_root_id, alto_root_quantum)
 
                 num_new_tokens = min(num_new_tokens,
-                                     alto_v1_root_quota_left)
+                                     alto_root_quota_left)
 
             # Schedule encoder inputs.
             encoder_inputs_to_schedule = None
@@ -400,14 +409,14 @@ class Scheduler(SchedulerInterface):
             req_to_new_blocks[request.request_id] = new_blocks
             num_scheduled_tokens[request.request_id] = num_new_tokens
             token_budget -= num_new_tokens
-            if alto_v1_root_id is not None:
-                assert alto_v1_root_quantum is not None
-                self.waiting.account_root_tokens(alto_v1_root_id,
+            if alto_root_id is not None:
+                assert alto_root_quantum is not None
+                self.waiting.account_root_tokens(alto_root_id,
                                                  num_new_tokens,
-                                                 alto_v1_root_quantum)
-                if (alto_v1_root_quota_left is not None
-                        and num_new_tokens >= alto_v1_root_quota_left):
-                    alto_v1_deferred_roots.add(alto_v1_root_id)
+                                                 alto_root_quantum)
+                if (alto_root_quota_left is not None
+                        and num_new_tokens >= alto_root_quota_left):
+                    alto_deferred_roots.add(alto_root_id)
             req_index += 1
 
             # Speculative decode related.
@@ -550,21 +559,21 @@ class Scheduler(SchedulerInterface):
 
                     num_new_tokens = min(num_new_tokens, token_budget)
 
-                    if isinstance(self.waiting, AltoDRRRequestQueueV1):
+                    if isinstance(self.waiting, AltoRequestQueue):
                         root_token_quantum = self._alto_root_token_quantum()
                         root_id = self.waiting.peek_root_id()
-                        if root_id in alto_v1_deferred_roots:
+                        if root_id in alto_deferred_roots:
                             if self.waiting.defer_current_root():
                                 continue
-                            if self._alto_v1_has_other_prefill_root(root_id):
+                            if self._alto_has_other_prefill_root(root_id):
                                 break
                             self.waiting.reset_root_budget(root_id)
-                            alto_v1_deferred_roots.discard(root_id)
+                            alto_deferred_roots.discard(root_id)
                         root_quota_left = self.waiting.current_root_token_budget(
                             root_token_quantum)
                         if root_quota_left == 0:
-                            if self._alto_v1_has_other_prefill_root(root_id):
-                                alto_v1_deferred_roots.add(root_id)
+                            if self._alto_has_other_prefill_root(root_id):
+                                alto_deferred_roots.add(root_id)
                                 if self.waiting.defer_current_root():
                                     continue
                                 break
@@ -642,7 +651,7 @@ class Scheduler(SchedulerInterface):
                     skipped_waiting_requests.prepend_request(request)
                     request.status = RequestStatus.WAITING_FOR_REMOTE_KVS
                     continue
-                if isinstance(self.waiting, AltoDRRRequestQueueV1):
+                if isinstance(self.waiting, AltoRequestQueue):
                     if root_token_quantum is None:
                         root_token_quantum = self._alto_root_token_quantum()
                     request = self.waiting.pop_request_and_account(
@@ -651,6 +660,7 @@ class Scheduler(SchedulerInterface):
                     )
                 else:
                     request = self.waiting.pop_request()
+
                 req_index += 1
                 self.running.append(request)
                 if self.log_stats:
@@ -772,6 +782,7 @@ class Scheduler(SchedulerInterface):
             self.kv_event_publisher.publish(batch)
 
         self._update_after_schedule(scheduler_output)
+        self._alto_prune_inactive_root_budgets()
         return scheduler_output
 
     def _update_after_schedule(

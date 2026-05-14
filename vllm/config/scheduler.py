@@ -18,7 +18,7 @@ from vllm.utils import (DEFAULT_MAX_NUM_BATCHED_TOKENS,
 logger = init_logger(__name__)
 
 RunnerType = Literal["generate", "pooling", "draft"]
-SchedulerPolicy = Literal["fcfs", "priority", "alto_drr", "alto_drr_v1"]
+SchedulerPolicy = Literal["fcfs", "priority", "alto"]
 
 
 @config
@@ -117,11 +117,7 @@ class SchedulerConfig:
     of arrival.\n
     - "priority" means requests are handled based on given priority (lower
     value means earlier handling) and time of arrival deciding any ties).
-    - "alto_drr" means Alto ancestry-aware DRR scheduling. Requests 
-    are grouped by Alto flow id and admitted fairly across flows. 
-    (lower Alto local id means earlier handling, with arrival time
-    deciding any ties).
-    - "alto_drr_v1" means Alto ancestry-aware hierarchical DRR scheduling. 
+    - "alto" means Alto ancestry-aware hierarchical scheduling. 
     Requests are grouped by Alto root id(request id) and scheduled fairly across roots.
     Within each root, flows are ordered by their Alto flow path, and requests
     within the same flow are ordered by Alto local id, with arrival time
