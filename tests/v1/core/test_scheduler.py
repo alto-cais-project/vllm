@@ -13,7 +13,6 @@ from vllm.multimodal.inputs import (MultiModalFeatureSpec,
                                     MultiModalKwargsItem, PlaceholderRange)
 from vllm.sampling_params import SamplingParams, StructuredOutputsParams
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
-from vllm.v1.core.sched.request_queue import AltoDRRRequestQueue
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.kv_cache_interface import (FullAttentionSpec, KVCacheConfig,
                                         KVCacheGroupSpec)
@@ -1339,141 +1338,6 @@ def create_requests_with_priority(
     return requests
 
 
-def create_alto_drr_request(
-    request_id: str,
-    flow_id: Optional[str] = None,
-    local_id: Optional[int] = None,
-    arrival_time: float = 0.0,
-    num_tokens: int = 10,
-) -> Request:
-    """Create a request with optional Alto ancestry DRR trace headers.
-
-    For ancestry [7, 3, 2], flow_id is the parent prefix "7/3" and
-    local_id is the current child id 2.
-    """
-    sampling_params = SamplingParams(ignore_eos=False, max_tokens=16)
-    trace_headers = None
-    if flow_id is not None or local_id is not None:
-        trace_headers = {}
-        if flow_id is not None:
-            trace_headers["alto-flow-id"] = flow_id
-        if local_id is not None:
-            trace_headers["alto-local-id"] = str(local_id)
-
-    return Request(
-        request_id=request_id,
-        prompt_token_ids=[0] * num_tokens,
-        sampling_params=sampling_params,
-        pooling_params=None,
-        eos_token_id=EOS_TOKEN_ID,
-        arrival_time=arrival_time,
-        trace_headers=trace_headers,
-    )
-
-
-def test_alto_drr_same_flow_orders_by_local_id():
-    queue = AltoDRRRequestQueue()
-    requests = [
-        create_alto_drr_request("child2", flow_id="7/3", local_id=2,
-                                arrival_time=2.0),
-        create_alto_drr_request("child0", flow_id="7/3", local_id=0,
-                                arrival_time=1.0),
-        create_alto_drr_request("child1", flow_id="7/3", local_id=1,
-                                arrival_time=0.0),
-    ]
-
-    for request in requests:
-        queue.add_request(request)
-
-    assert [queue.pop_request().request_id for _ in range(3)] == [
-        "child0", "child1", "child2"
-    ]
-
-
-def test_alto_drr_round_robins_across_flows():
-    queue = AltoDRRRequestQueue()
-    requests = [
-        create_alto_drr_request("7/3:0", flow_id="7/3", local_id=0,
-                                arrival_time=1.0),
-        create_alto_drr_request("7/3:1", flow_id="7/3", local_id=1,
-                                arrival_time=0.0),
-        create_alto_drr_request("7/4:0", flow_id="7/4", local_id=0,
-                                arrival_time=0.0),
-        create_alto_drr_request("7/4:1", flow_id="7/4", local_id=1,
-                                arrival_time=1.0),
-    ]
-
-    for request in requests:
-        queue.add_request(request)
-
-    assert [queue.pop_request().request_id for _ in range(4)] == [
-        "7/3:0", "7/4:0", "7/3:1", "7/4:1"
-    ]
-
-
-def test_alto_drr_missing_headers_use_default_flow():
-    queue = AltoDRRRequestQueue()
-    requests = [
-        create_alto_drr_request("2", arrival_time=2.0),
-        create_alto_drr_request("0", arrival_time=0.0),
-        create_alto_drr_request("1", arrival_time=1.0),
-    ]
-
-    for request in requests:
-        queue.add_request(request)
-
-    assert [queue.pop_request().request_id for _ in range(3)] == [
-        "0", "1", "2"
-    ]
-
-
-def test_alto_drr_one_layer_ancestry_uses_root_flow():
-    queue = AltoDRRRequestQueue()
-    requests = [
-        create_alto_drr_request("root7", flow_id="0", local_id=7,
-                                arrival_time=1.0),
-        create_alto_drr_request("root3", flow_id="0", local_id=3,
-                                arrival_time=0.0),
-    ]
-
-    for request in requests:
-        queue.add_request(request)
-
-    assert [queue.pop_request().request_id for _ in range(2)] == [
-        "root3", "root7"
-    ]
-
-
-def test_alto_drr_peek_then_pop_returns_same_request():
-    queue = AltoDRRRequestQueue()
-    queue.add_request(
-        create_alto_drr_request("7/3:0", flow_id="7/3", local_id=0,
-                                arrival_time=0.0))
-    queue.add_request(
-        create_alto_drr_request("7/4:0", flow_id="7/4", local_id=0,
-                                arrival_time=0.0))
-
-    peeked = queue.peek_request()
-    popped = queue.pop_request()
-
-    assert popped is peeked
-
-
-def test_alto_drr_remove_request_keeps_nonempty_flow_active():
-    queue = AltoDRRRequestQueue()
-    keep = create_alto_drr_request("keep", flow_id="7/3", local_id=0,
-                                   arrival_time=0.0)
-    remove = create_alto_drr_request("remove", flow_id="7/3", local_id=1,
-                                     arrival_time=1.0)
-
-    queue.add_request(keep)
-    queue.add_request(remove)
-    queue.remove_request(remove)
-
-    assert len(queue) == 1
-    assert queue.pop_request() is keep
-
-
 def test_priority_scheduling_basic_ordering():
     """Test that requests are scheduled in priority order
     (lower value = higher priority)."""
@@ -1921,6 +1785,429 @@ def test_priority_scheduling_heap_property():
     # Verify requests were scheduled in priority order (lowest value first)
     expected_priorities = sorted(priorities)
     assert scheduled_priorities == expected_priorities
+
+
+def create_scheduler_with_alto(
+    model: str = "facebook/opt-125m",
+    max_num_seqs: int = 16,
+    max_num_batched_tokens: int = 8192,
+    num_blocks: int = 10000,
+    block_size: int = 16,
+    max_model_len: Optional[int] = None,
+) -> Scheduler:
+    '''Create scheduler with ALTO policy enabled.'''
+    if max_model_len is None:
+        max_model_len = max_num_batched_tokens
+    scheduler_config = SchedulerConfig(
+        max_num_seqs=max_num_seqs,
+        max_num_batched_tokens=max_num_batched_tokens,
+        max_model_len=max_model_len,
+        enable_chunked_prefill=True,
+        policy="alto",
+    )
+    model_config = ModelConfig(
+        model=model,
+        trust_remote_code=True,
+        dtype="float16",
+        seed=42,
+    )
+    cache_config = CacheConfig(
+        block_size=block_size,
+        gpu_memory_utilization=0.9,
+        swap_space=0,
+        cache_dtype="auto",
+    )
+    vllm_config = VllmConfig(
+        scheduler_config=scheduler_config,
+        model_config=model_config,
+        cache_config=cache_config,
+    )
+    kv_cache_config = KVCacheConfig(
+        num_blocks=num_blocks,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(['layer'],
+                             FullAttentionSpec(block_size, 1, 1, torch.float32,
+                                               False))
+        ],
+    )
+    cache_config.num_gpu_blocks = num_blocks
+    return Scheduler(
+        vllm_config=vllm_config,
+        kv_cache_config=kv_cache_config,
+        log_stats=True,
+        structured_output_manager=StructuredOutputManager(vllm_config),
+    )
+
+
+def create_requests_with_alto(num_requests: int,
+                              root_ids: list[int],
+                              flow_ids: Optional[list[Optional[str]]] = None,
+                              local_ids: Optional[list[int]] = None,
+                              arrival_times: Optional[list[float]] = None,
+                              num_tokens: int = 10,
+                              max_tokens: int = 16,
+                              starting_idx: int = 0):
+    """Create requests with ALTO root and ancestry trace headers."""
+    assert len(root_ids) == num_requests
+    if flow_ids is not None:
+        assert len(flow_ids) == num_requests
+    else:
+        flow_ids = [None] * num_requests
+    if local_ids is not None:
+        assert len(local_ids) == num_requests
+    else:
+        local_ids = list(range(num_requests))
+    if arrival_times is not None:
+        assert len(arrival_times) == num_requests
+    else:
+        arrival_times = [float(i) for i in range(num_requests)]
+
+    seen_trace_keys = set()
+    seen_root_local_ids = set()
+    sampling_params = SamplingParams(ignore_eos=False, max_tokens=max_tokens)
+    requests = []
+    for i in range(num_requests):
+        trace_key = (root_ids[i], flow_ids[i], local_ids[i])
+        root_local_key = (root_ids[i], local_ids[i])
+        assert trace_key not in seen_trace_keys
+        assert root_local_key not in seen_root_local_ids
+        seen_trace_keys.add(trace_key)
+        seen_root_local_ids.add(root_local_key)
+
+        trace_headers = {
+            "alto-root-id": str(root_ids[i]),
+            "alto-local-id": str(local_ids[i]),
+        }
+        flow_id = flow_ids[i]
+        if flow_id is not None:
+            trace_headers["alto-flow-id"] = flow_id
+
+        request = Request(
+            request_id=f"{i + starting_idx}",
+            prompt_token_ids=[i + starting_idx] * num_tokens,
+            sampling_params=sampling_params,
+            pooling_params=None,
+            eos_token_id=EOS_TOKEN_ID,
+            arrival_time=arrival_times[i],
+            trace_headers=trace_headers,
+        )
+        requests.append(request)
+    return requests
+
+
+def test_alto_scheduling_basic_ordering():
+    """Test ALTO scheduling orders same-root requests by ancestry."""
+    scheduler = create_scheduler_with_alto()
+
+    # Create requests in one root with different local ancestry ids.
+    root_ids = [0, 0, 0]
+    local_ids = [2, 0, 1]
+    arrival_times = [1.0, 2.0, 3.0]
+    requests = create_requests_with_alto(num_requests=3,
+                                         root_ids=root_ids,
+                                         local_ids=local_ids,
+                                         arrival_times=arrival_times)
+
+    # Add requests in non-ancestry order.
+    for request in requests:
+        scheduler.add_request(request)
+
+    # Schedule and verify ALTO ancestry order.
+    output = scheduler.schedule()
+
+    # Should schedule all requests since they fit in budget.
+    assert len(output.scheduled_new_reqs) == 3
+
+    # Verify they are scheduled by local id:
+    # req_1 (local 0), req_2 (local 1), req_0 (local 2)
+    scheduled_req_ids = [req.req_id for req in output.scheduled_new_reqs]
+    assert scheduled_req_ids == ["1", "2", "0"]
+
+
+def test_alto_scheduling_flow_ancestry_ordering():
+    """Test ALTO scheduling orders nested ancestry after root children."""
+    scheduler = create_scheduler_with_alto()
+
+    # Create valid same-root requests across two parent flows.
+    # Root children 0 and 1 sort before children under flow 2.
+    root_ids = [0, 0, 0, 0]
+    flow_ids = ["2", None, "2", None]
+    local_ids = [3, 1, 2, 0]
+    arrival_times = [1.0, 2.0, 3.0, 4.0]
+    requests = create_requests_with_alto(num_requests=4,
+                                         root_ids=root_ids,
+                                         flow_ids=flow_ids,
+                                         local_ids=local_ids,
+                                         arrival_times=arrival_times)
+
+    # Add requests in non-ancestry order.
+    for request in requests:
+        scheduler.add_request(request)
+
+    # Schedule and verify flow ancestry order.
+    output = scheduler.schedule()
+
+    # Should schedule all requests since they fit in budget.
+    assert len(output.scheduled_new_reqs) == 4
+
+    # Expected order:
+    # 1. req_3 (root child 0)
+    # 2. req_1 (root child 1)
+    # 3. req_2 (flow 2 child 2)
+    # 4. req_0 (flow 2 child 3)
+    scheduled_req_ids = [req.req_id for req in output.scheduled_new_reqs]
+    assert scheduled_req_ids == ["3", "1", "2", "0"]
+
+
+def test_alto_scheduling_mixed_ancestry_and_arrival():
+    """Test ALTO scheduling with mixed ancestry and arrival times."""
+    scheduler = create_scheduler_with_alto()
+
+    # Create same-root requests with mixed flow ancestry and local ids.
+    root_ids = [0, 0, 0, 0]
+    flow_ids = [None, "2", "2", None]
+    local_ids = [3, 1, 2, 0]
+    arrival_times = [1.0, 3.0, 2.0, 4.0]
+    requests = create_requests_with_alto(num_requests=4,
+                                         root_ids=root_ids,
+                                         flow_ids=flow_ids,
+                                         local_ids=local_ids,
+                                         arrival_times=arrival_times)
+
+    # Add requests.
+    for request in requests:
+        scheduler.add_request(request)
+
+    # Schedule and verify order.
+    output = scheduler.schedule()
+
+    # Should schedule all requests since they fit in budget.
+    assert len(output.scheduled_new_reqs) == 4
+
+    # Expected order:
+    # 1. req_3 (root child 0)
+    # 2. req_0 (root child 3)
+    # 3. req_1 (flow 2 child 1)
+    # 4. req_2 (flow 2 child 2)
+    scheduled_req_ids = [req.req_id for req in output.scheduled_new_reqs]
+    assert scheduled_req_ids == ["3", "0", "1", "2"]
+
+
+def test_alto_scheduling_waiting_queue_order():
+    """Test that the ALTO waiting queue maintains ancestry order."""
+    scheduler = create_scheduler_with_alto(
+        max_num_seqs=1,  # Only one request can run at a time.
+    )
+
+    # Create multiple same-root requests with different local ancestry ids.
+    root_ids = [0, 0, 0, 0]
+    local_ids = [3, 1, 2, 0]
+    arrival_times = [1.0, 2.0, 3.0, 4.0]
+    requests = create_requests_with_alto(num_requests=4,
+                                         root_ids=root_ids,
+                                         local_ids=local_ids,
+                                         arrival_times=arrival_times)
+
+    # Add all requests.
+    for request in requests:
+        scheduler.add_request(request)
+
+    # Schedule - should only schedule the first ancestry request.
+    output = scheduler.schedule()
+    assert len(output.scheduled_new_reqs) == 1
+    assert output.scheduled_new_reqs[0].req_id == "3"
+
+    # Verify waiting queue has remaining requests in ancestry order.
+    assert len(scheduler.waiting) == 3
+
+    waiting_requests = list(scheduler.waiting)
+    waiting_local_ids = [
+        int(req.trace_headers["alto-local-id"]) for req in waiting_requests
+    ]
+    waiting_req_ids = [req.request_id for req in waiting_requests]
+
+    # Should be ordered by local id: req_1 (1), req_2 (2), req_0 (3).
+    assert waiting_req_ids == ["1", "2", "0"]
+    assert waiting_local_ids == [1, 2, 3]
+
+
+def test_alto_scheduling_with_limited_slots():
+    """Test ALTO scheduling when max_num_seqs limits concurrent requests."""
+    scheduler = create_scheduler_with_alto(
+        max_num_seqs=2,  # Only allow 2 concurrent requests.
+        max_num_batched_tokens=8,
+        max_model_len=32,
+    )
+
+    # Create two roots with two requests each.
+    requests = create_requests_with_alto(num_requests=4,
+                                         root_ids=[0, 0, 1, 1],
+                                         local_ids=[0, 1, 0, 1],
+                                         num_tokens=4)
+
+    # Add all requests.
+    for request in requests:
+        scheduler.add_request(request)
+
+    # Schedule - should admit one request from each root.
+    output = scheduler.schedule()
+    assert len(output.scheduled_new_reqs) == 2
+
+    scheduled_req_ids = [req.req_id for req in output.scheduled_new_reqs]
+    assert scheduled_req_ids == ["0", "2"]
+
+    # Remaining requests should stay in ALTO root order.
+    assert len(scheduler.waiting) == 2
+
+    waiting_requests = list(scheduler.waiting)
+    waiting_req_ids = [req.request_id for req in waiting_requests]
+    assert waiting_req_ids == ["1", "3"]
+
+
+def test_alto_scheduling_freezes_new_root_admission_under_kv_pressure(
+        monkeypatch):
+    """Test ALTO blocks new roots under KV pressure."""
+    scheduler = create_scheduler_with_alto(
+        max_num_seqs=4,
+        max_num_batched_tokens=8,
+        max_model_len=32,
+    )
+    request = create_requests_with_alto(num_requests=1,
+                                        root_ids=[0],
+                                        local_ids=[0],
+                                        num_tokens=2)[0]
+    scheduler.add_request(request)
+
+    output = scheduler.schedule()
+    assert [req.req_id for req in output.scheduled_new_reqs] == ["0"]
+
+    same_root, new_root = create_requests_with_alto(num_requests=2,
+                                                    root_ids=[0, 1],
+                                                    local_ids=[1, 0],
+                                                    num_tokens=2,
+                                                    starting_idx=1)
+    scheduler.add_request(same_root)
+    scheduler.add_request(new_root)
+    monkeypatch.setattr(type(scheduler.kv_cache_manager), "usage",
+                        property(lambda _: 0.9))
+
+    output = scheduler.schedule()
+
+    assert [req.req_id for req in output.scheduled_new_reqs] == ["1"]
+    assert new_root.request_id not in output.num_scheduled_tokens
+    assert len(scheduler.waiting) == 1
+    assert scheduler.waiting.peek_request() is new_root
+
+
+def test_alto_scheduling_orders_in_running_queue():
+    scheduler = create_scheduler_with_alto(
+        max_num_seqs=3,
+        max_num_batched_tokens=30,
+        max_model_len=64,
+    )
+    requests = create_requests_with_alto(
+        num_requests=3,
+        root_ids=[0, 0, 0],
+        local_ids=[2, 0, 1],
+        num_tokens=10,
+    )
+    for request in requests:
+        scheduler.add_request(request)
+    output = scheduler.schedule()
+    assert [req.req_id for req in output.scheduled_new_reqs] == ["1", "2", "0"]
+    # Force running queue into the wrong order.
+    scheduler.running = [requests[0], requests[2], requests[1]]
+    scheduler._running_queue_dirty = True
+    for request in scheduler.running:
+        request.num_computed_tokens = 0
+
+    output = scheduler.schedule()
+
+    assert output.scheduled_cached_reqs.req_ids == ["1", "2", "0"]
+    assert [req.request_id for req in scheduler.running] == ["1", "2", "0"]
+
+
+def test_alto_multi_root_fairness_chunking():
+    """Test that the scheduler fairly splits the budget into quantums 
+    when multiple ALTO roots compete."""
+    scheduler = create_scheduler_with_alto(
+        max_num_seqs=2,
+        max_num_batched_tokens=1000,
+        max_model_len=2000,
+    )
+
+    requests = create_requests_with_alto(
+        num_requests=2,
+        root_ids=[0, 1],
+        num_tokens=1000,
+    )
+
+    for req in requests:
+        scheduler.add_request(req)
+
+    output = scheduler.schedule()
+
+    assert output.num_scheduled_tokens[requests[0].request_id] == 500
+    assert output.num_scheduled_tokens[requests[1].request_id] == 500
+
+
+def test_alto_single_root_consumes_full_budget():
+    """Test that a single active ALTO root can consume the entire step budget
+        without being constrained by the quantum."""
+    scheduler = create_scheduler_with_alto(
+        max_num_seqs=1,
+        max_num_batched_tokens=1000,
+        max_model_len=2000,
+    )
+
+    requests = create_requests_with_alto(
+        num_requests=1,
+        root_ids=[0],
+        num_tokens=1000,
+    )
+    scheduler.add_request(requests[0])
+
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens[requests[0].request_id] == 1000
+
+
+def test_alto_prune_inactive_root_budgets():
+    """Test that ALTO correctly cleans up budget state 
+        for inactive roots to prevent memory leaks."""
+    scheduler = create_scheduler_with_alto(
+        max_num_seqs=1,
+        max_num_batched_tokens=10,
+        max_model_len=200,
+    )
+
+    requests = create_requests_with_alto(
+        num_requests=1,
+        root_ids=[0],
+        num_tokens=20,
+    )
+    for request in requests:
+        scheduler.add_request(request)
+    output = scheduler.schedule()
+    assert 0 in scheduler.waiting._root_tokens_used
+
+    # Simulate the model finishing the request
+    model_output = ModelRunnerOutput(
+        req_ids=[requests[0].request_id],
+        req_id_to_index={requests[0].request_id: 0},
+        sampled_token_ids=[[EOS_TOKEN_ID]],
+        logprobs=None,
+        prompt_logprobs_dict={},
+        pooler_output=[],
+    )
+    scheduler.update_from_output(output, model_output)
+    # Verify the request is finished and removed from running queue
+    assert requests[0].is_finished()
+    assert len(scheduler.running) == 0
+    scheduler.schedule()
+    assert 0 not in scheduler.waiting._root_tokens_used
+    assert 0 not in scheduler.waiting._active_roots
+    assert 0 not in scheduler.waiting._roots
 
 
 def test_schedule_skip_tokenizer_init():

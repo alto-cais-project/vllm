@@ -214,7 +214,7 @@ class PriorityRequestQueue(RequestQueue):
         """Iterate over the queue in reverse priority order."""
         return reversed(list(self))
 
-    
+
 class AltoRequestQueue(RequestQueue):
     """
     Alto ancestry-aware root-level queue.
@@ -231,9 +231,8 @@ class AltoRequestQueue(RequestQueue):
     ROOT_FLOW = "__root__"
 
     def __init__(self) -> None:
-        self._roots: dict[
-            int, list[tuple[tuple[int, ...], int, float, Request]]
-        ] = {}
+        self._roots: dict[int, list[tuple[tuple[int, ...], int, float,
+                                          Request]]] = {}
         self._root_order: deque[tuple[int, int]] = deque()
         self._active_roots: set[int] = set()
         self._root_epochs: dict[int, int] = {}
@@ -249,8 +248,9 @@ class AltoRequestQueue(RequestQueue):
         if value is None:
             raise ValueError("Missing required ALTO integer trace header")
         return int(value)
-    
-    def request_keys(self, request: Request) -> tuple[int, tuple[int, ...], int]:
+
+    def request_keys(self,
+                     request: Request) -> tuple[int, tuple[int, ...], int]:
         """Extract Alto root id, flow id, and local id for hierarchical DRR."""
         headers = request.trace_headers or {}
 
@@ -259,7 +259,7 @@ class AltoRequestQueue(RequestQueue):
         local_id = self._parse_int(headers.get("alto-local-id"))
 
         return root_id, self._parse_flow_rank(flow_id), local_id
-    
+
     @staticmethod
     def request_root_id(request: Request) -> int:
         headers = request.trace_headers or {}
@@ -267,12 +267,13 @@ class AltoRequestQueue(RequestQueue):
         if root_id is None:
             raise ValueError("Missing required ALTO root trace header")
         return int(root_id)
+
     @classmethod
     def _parse_flow_rank(cls, flow_id: str) -> tuple[int, ...]:
-        if flow_id in ("", "0", cls.ROOT_FLOW):
+        if flow_id in ("", cls.ROOT_FLOW):
             return ()
-        return tuple(int(part) for part in flow_id.split("/") if part)  
-    
+        return tuple(int(part) for part in flow_id.split("/") if part)
+
     def clear_cache(self) -> None:
         """Clear the cached peek candidate after any queue mutation."""
         self._cached_root = None
@@ -284,12 +285,12 @@ class AltoRequestQueue(RequestQueue):
     def active_root_ids(self) -> set[int]:
         """Return root ids that currently have waiting requests."""
         return set(self._active_roots)
-    
+
     def has_other_active_root(self, root_id: int) -> bool:
         if len(self._active_roots) > 1:
             return True
         return bool(self._active_roots) and root_id not in self._active_roots
-    
+
     def activate_root(self, root_id: int) -> None:
         """Create and activate a root so it participates in round-robin."""
         if root_id not in self._roots:
@@ -301,7 +302,7 @@ class AltoRequestQueue(RequestQueue):
             self._active_roots.add(root_id)
             self._root_order.append((root_id, epoch))
             self._root_tokens_used.setdefault(root_id, 0)
-    
+
     def remove_root_if_empty(self, root_id: int) -> None:
         """Deactivate an empty root while keeping root-order cleanup lazy."""
         if self._roots.get(root_id):
@@ -316,16 +317,16 @@ class AltoRequestQueue(RequestQueue):
         return (root_id in self._active_roots
                 and self._root_epochs.get(root_id) == epoch
                 and bool(self._roots.get(root_id)))
-    
+
     def fetch_next_live_root(self) -> int | None:
-        """Return the next active non-empty root, lazily dropping stale entries."""
+        """Return the next active non-empty root"""
         while self._root_order:
             root_id, epoch = self._root_order[0]
             if self._is_live_root_entry(root_id, epoch):
                 return root_id
             self._root_order.popleft()
         return None
-    
+
     def select_request(self) -> tuple[int, Request]:
         """Select and cache the next request without removing it."""
         if self._cached_root is not None and self._cached_request is not None:
@@ -345,14 +346,13 @@ class AltoRequestQueue(RequestQueue):
         """Peek at the selected request's root id without removing it."""
         root_id, _ = self.select_request()
         return root_id
-    
+
     def current_root_token_budget(self, root_token_quantum: int) -> int:
         """Return the remaining token budget for the selected root."""
         root_id, _ = self.select_request()
         return self.root_token_budget(root_id, root_token_quantum)
 
-    def root_token_budget(self, root_id: int,
-                          root_token_quantum: int) -> int:
+    def root_token_budget(self, root_id: int, root_token_quantum: int) -> int:
         """Return the remaining token budget for a root."""
         used = self._root_tokens_used.get(root_id, 0)
         return max(0, max(1, root_token_quantum) - used)
@@ -391,7 +391,7 @@ class AltoRequestQueue(RequestQueue):
                 self._root_tokens_used[root_id] = 0
                 self._root_order.rotate(-1)
                 self.clear_cache()
-    
+
     def add_request(self, request: Request) -> None:
         """Add a request into its root heap using ancestry order."""
         root_id, flow_rank, local_id = self.request_keys(request)
@@ -414,7 +414,7 @@ class AltoRequestQueue(RequestQueue):
         if not has_remaining_requests:
             self.remove_root_if_empty(root_id)
         return root_id, request, has_remaining_requests
-    
+
     def pop_request_without_accounting(self) -> Request:
         """Pop a skipped request without consuming root fairness budget."""
         _, request, _ = self._pop_selected_request()
@@ -432,12 +432,11 @@ class AltoRequestQueue(RequestQueue):
         """Pop a request and advance the root rotation."""
         return self.pop_request_and_account(1, 1)
 
-
     def peek_request(self) -> Request:
         """Peek at the next request in the queue without removing it."""
         _, request = self.select_request()
         return request
-    
+
     def prepend_request(self, request: Request) -> None:
         self.add_request(request)
 
@@ -455,13 +454,13 @@ class AltoRequestQueue(RequestQueue):
         requests_to_remove = set(requests)
 
         for root_id, heap in list(self._roots.items()):
-            new_heap = [(flow_rank, local_id, t, r) 
-                        for (flow_rank, local_id, t, r) in heap 
+            new_heap = [(flow_rank, local_id, t, r)
+                        for (flow_rank, local_id, t, r) in heap
                         if r not in requests_to_remove]
             removed = len(heap) - len(new_heap)
             if removed == 0:
                 continue
-        
+
             heapq.heapify(new_heap)
             self._roots[root_id] = new_heap
             self._size -= removed
@@ -483,10 +482,8 @@ class AltoRequestQueue(RequestQueue):
 
     def __iter__(self) -> Iterator[Request]:
         """Iterate over requests in DRR order without mutating the queue."""
-        root_order = deque(
-            root_id for root_id, epoch in self._root_order
-            if self._is_live_root_entry(root_id, epoch)
-        )
+        root_order = deque(root_id for root_id, epoch in self._root_order
+                           if self._is_live_root_entry(root_id, epoch))
         roots = {
             root_id: heap[:]
             for root_id, heap in self._roots.items()
@@ -507,6 +504,7 @@ class AltoRequestQueue(RequestQueue):
     def __reversed__(self) -> Iterator[Request]:
         """Iterate over the current DRR order in reverse."""
         return reversed(list(self))
+
 
 def create_request_queue(policy: SchedulingPolicy) -> RequestQueue:
     """Create request queue based on scheduling policy."""
