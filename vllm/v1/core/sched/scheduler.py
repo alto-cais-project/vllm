@@ -181,19 +181,39 @@ class Scheduler(SchedulerInterface):
         )
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
 
-    def _adjust_tokens_for_streaming_prefill(self, request: Request,
-                                             num_new_tokens: int) -> int:
+    def _adjust_tokens_for_streaming_prefill(
+            self,
+            request: Request,
+            num_new_tokens: int,
+            num_computed_tokens: Optional[int] = None) -> int:
+        """Hold a streaming-prefill request one token short of its prompt.
+
+        Such a request must not sample until its prompt has finished arriving,
+        so it is capped at ``current_prompt_length - 1`` computed tokens.
+
+        ``num_computed_tokens`` is how many tokens the caller already counts as
+        computed in this scheduling step. It defaults to
+        ``request.num_computed_tokens``, which is correct for a running
+        request, but the waiting path must pass its own local count: that one
+        includes the tokens supplied by a prefix-cache hit, which are not yet
+        reflected on the request. Clamping against the stale attribute there
+        lets a warm cache carry the request past the cap, so it samples a token
+        while the rest of its prompt is still streaming in and everything after
+        that is conditioned on a corrupted sequence.
+        """
+        if num_computed_tokens is None:
+            num_computed_tokens = request.num_computed_tokens
         if (request.is_streaming_prefill
                 and not request.is_streaming_prefill_stopped):
             uncomputed_prompt_tokens = (request.current_prompt_length -
-                                        request.num_computed_tokens)
+                                        num_computed_tokens)
             if uncomputed_prompt_tokens >= 0:
                 max_prompt_to_compute = max(0,
                                             request.current_prompt_length - 1)
                 num_new_tokens = max(
                     0,
                     min(num_new_tokens,
-                        max_prompt_to_compute - request.num_computed_tokens))
+                        max_prompt_to_compute - num_computed_tokens))
         # print(request.prompt_token_ids, request.output_token_ids,
         #       request.num_computed_tokens, request.current_prompt_length,
         #       num_new_tokens, request.is_streaming_prefill, request.request_id
@@ -464,7 +484,16 @@ class Scheduler(SchedulerInterface):
                     # requests, which have output tokens.
                     num_new_tokens = request.num_tokens - num_computed_tokens
                     num_new_tokens = self._adjust_tokens_for_streaming_prefill(
-                        request, num_new_tokens)
+                        request, num_new_tokens, num_computed_tokens)
+                    if num_new_tokens == 0:
+                        # Streaming-prefill request whose cached prefix already
+                        # covers everything it is allowed to compute. It cannot
+                        # make progress until more of its prompt arrives, so
+                        # leave it in the waiting queue rather than scheduling
+                        # zero tokens, which would trip the assert below.
+                        self.waiting.pop_request()
+                        skipped_waiting_requests.prepend_request(request)
+                        continue
                     if (0 < self.scheduler_config.long_prefill_token_threshold
                             < num_new_tokens):
                         num_new_tokens = (
