@@ -643,11 +643,17 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             if new_prompt_token_ids is not None:
                 # This is a streaming prefill request with updated tokens.
                 old_num_prompt_tokens = req_state.num_prompt_tokens
-                new_num_prompt_tokens = len(new_prompt_token_ids)
+                offset = (req_data.prompt_token_offsets[i]
+                          if req_data.prompt_token_offsets is not None else 0)
+                assert offset == 0 or offset == old_num_prompt_tokens
+                new_num_prompt_tokens = offset + len(new_prompt_token_ids)
 
                 if new_num_prompt_tokens != old_num_prompt_tokens:
                     # Update CachedRequestState.
-                    req_state.prompt_token_ids = new_prompt_token_ids
+                    if offset:
+                        req_state.prompt_token_ids.extend(new_prompt_token_ids)
+                    else:
+                        req_state.prompt_token_ids = new_prompt_token_ids
                     req_state.num_prompt_tokens = new_num_prompt_tokens
 
                     # Update InputBatch arrays if request is in the batch.
@@ -655,7 +661,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     if req_index is not None:
                         # Update token_ids_cpu with new prompt tokens.
                         self.input_batch.token_ids_cpu[
-                            req_index, :new_num_prompt_tokens] = (
+                            req_index, offset:new_num_prompt_tokens] = (
                                 new_prompt_token_ids)
                         self.input_batch.is_token_ids[
                             req_index, :new_num_prompt_tokens] = True

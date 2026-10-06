@@ -741,8 +741,11 @@ class EngineCoreProc(EngineCore):
         """Exits when an engine step needs to be performed."""
 
         waited = False
-        while not self.engines_running and not self.scheduler.has_requests() \
-                and not self.batch_queue:
+        while (not self.engines_running and not self.batch_queue
+               and (not self.scheduler.has_requests()
+                    or (not getattr(self.scheduler, "use_pp", True)
+                        and getattr(self.scheduler, "waiting_for_stream_input",
+                                    lambda: False)()))):
             if logger.isEnabledFor(DEBUG) and self.input_queue.empty():
                 logger.debug("EngineCore waiting for work.")
                 waited = True

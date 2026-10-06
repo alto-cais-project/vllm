@@ -44,7 +44,11 @@ class NewRequestData:
     ) -> NewRequestData:
         return cls(
             req_id=request.request_id,
-            prompt_token_ids=request.prompt_token_ids,
+            # UniProcExecutor shares Python objects with the scheduler. The
+            # GPU runner appends deltas to its own list, never the Request's.
+            prompt_token_ids=(request.prompt_token_ids.copy()
+                              if request.is_streaming_prefill
+                              else request.prompt_token_ids),
             mm_features=request.mm_features,
             sampling_params=request.sampling_params,
             pooling_params=request.pooling_params,
@@ -103,9 +107,10 @@ class CachedRequestData:
     num_computed_tokens: list[int]
     num_output_tokens: list[int]
     # NOTE: prompt_token_ids is only used for streaming prefill.
-    # When a request has streaming prefill, this contains the full current
-    # prompt_token_ids list so the worker can update its cached state.
+    # Streaming prompt increments, starting at prompt_token_offsets[i].
+    # A missing offsets list preserves the historical full-prompt format.
     prompt_token_ids: list[Optional[list[int]]]
+    prompt_token_offsets: Optional[list[int]] = None
 
     @property
     def num_reqs(self) -> int:

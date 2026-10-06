@@ -115,6 +115,8 @@ class Scheduler(SchedulerInterface):
         self.requests: dict[str, Request] = {}
         # req_id -> list[int]
         self.prefill_streams: dict[str, list[int]] = {}
+        self._sent_prompt_lengths: dict[str, int] = {}
+        self._stream_input_blocked: set[str] = set()
         # set[req_id]
         self.stopped_prefill_streams: set[str] = set()
         # Scheduling policy
@@ -249,6 +251,8 @@ class Scheduler(SchedulerInterface):
         # For logging.
         scheduled_timestamp = time.monotonic()
 
+        # Recompute which cache-hit waiting requests need external input.
+        self._stream_input_blocked.clear()
         # Inject streamed prefill tokens into requests.
         has_new_tokens = set()
         for request_id, token_ids in list(self.prefill_streams.items()):
@@ -486,6 +490,9 @@ class Scheduler(SchedulerInterface):
                     num_new_tokens = self._adjust_tokens_for_streaming_prefill(
                         request, num_new_tokens, num_computed_tokens)
                     if num_new_tokens == 0:
+                        if (request.is_streaming_prefill
+                                and not request.is_streaming_prefill_stopped):
+                            self._stream_input_blocked.add(request.request_id)
                         # Streaming-prefill request whose cached prefix already
                         # covers everything it is allowed to compute. It cannot
                         # make progress until more of its prompt arrives, so
@@ -640,6 +647,9 @@ class Scheduler(SchedulerInterface):
                 req, req_to_new_blocks[req.request_id].get_block_ids())
             for req in scheduled_new_reqs
         ]
+        for req in scheduled_new_reqs:
+            if req.is_streaming_prefill:
+                self._sent_prompt_lengths[req.request_id] = len(req.prompt_token_ids)
         cached_reqs_data = self._make_cached_request_data(
             scheduled_running_reqs,
             scheduled_resumed_reqs,
@@ -744,6 +754,8 @@ class Scheduler(SchedulerInterface):
         num_computed_tokens: list[int] = []
         num_output_tokens: list[int] = []
         prompt_token_ids: list[Optional[list[int]]] = []
+        prompt_token_offsets: list[int] = []
+        resumed_ids = {req.request_id for req in resumed_reqs}
 
         use_connector = self.connector is not None
         for req in itertools.chain(running_reqs, resumed_reqs):
@@ -770,13 +782,18 @@ class Scheduler(SchedulerInterface):
             num_computed_tokens.append(req.num_computed_tokens)
             num_output_tokens.append(len(req.output_token_ids))
 
-            # For streaming prefill requests, send the current prompt_token_ids
-            # so the worker can update its cached state.
-            if (req.is_streaming_prefill
-                    and not req.is_streaming_prefill_stopped):
-                prompt_token_ids.append(req.prompt_token_ids)
+            # Send only newly appended prompt IDs. Resumption refreshes the
+            # full prompt; EOS must not suppress a final unsent increment.
+            offset = self._sent_prompt_lengths.get(req_id, 0)
+            if req_id in resumed_ids:
+                offset = 0
+            if req.is_streaming_prefill and offset != len(req.prompt_token_ids):
+                prompt_token_ids.append(req.prompt_token_ids[offset:])
+                prompt_token_offsets.append(offset)
+                self._sent_prompt_lengths[req_id] = len(req.prompt_token_ids)
             else:
                 prompt_token_ids.append(None)
+                prompt_token_offsets.append(0)
         # Because resumed_reqs is usually empty, it is more efficient to do
         # in-place appending so that we don't need to allocate a new list.
         resumed_from_preemption = [False] * len(running_reqs)
@@ -790,6 +807,7 @@ class Scheduler(SchedulerInterface):
             num_computed_tokens=num_computed_tokens,
             num_output_tokens=num_output_tokens,
             prompt_token_ids=prompt_token_ids,
+            prompt_token_offsets=prompt_token_offsets,
         )
 
     def _try_schedule_encoder_inputs(
@@ -1267,6 +1285,8 @@ class Scheduler(SchedulerInterface):
 
         # Clean up streaming prefill data structures.
         self.prefill_streams.pop(request_id, None)
+        self._sent_prompt_lengths.pop(request_id, None)
+        self._stream_input_blocked.discard(request_id)
         self.stopped_prefill_streams.discard(request_id)
 
         return kv_xfer_params
@@ -1275,6 +1295,22 @@ class Scheduler(SchedulerInterface):
         assert request.is_finished()
         self.kv_cache_manager.free(request)
         del self.requests[request.request_id]
+
+    def waiting_for_stream_input(self) -> bool:
+        """True only when external input is the sole possible source of work.
+
+        Never sleep with unfinished cleanup, an asynchronous KV connector,
+        pending tokens/EOS, or a request that can still compute a token.
+        """
+        if (self.connector is not None or self.finished_req_ids
+                or self.stopped_prefill_streams
+                or any(self.prefill_streams.values())):
+            return False
+        return bool(self.requests) and all(
+            req.is_streaming_prefill and not req.is_streaming_prefill_stopped
+            and (req.num_computed_tokens >= req.current_prompt_length - 1
+                 or req.request_id in self._stream_input_blocked)
+            for req in self.requests.values())
 
     def get_num_unfinished_requests(self) -> int:
         return len(self.waiting) + len(self.running)
