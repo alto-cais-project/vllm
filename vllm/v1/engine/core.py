@@ -61,6 +61,77 @@ HANDSHAKE_TIMEOUT_MINS = 5
 _R = TypeVar('_R')  # Return type for collective_rpc
 
 
+class _PrefillTrace:
+    """Per-step record of which prompt tokens were computed, and when.
+
+    Enabled by VLLM_PREFILL_TRACE_DIR. One JSONL file per EngineCore process:
+      {"ev": "add", "ts", "rid", "plen", "streaming"}   request reached the core
+      {"ev": "chunk", "ts", "rid", "n"}                 n streamed prompt tokens
+      {"ev": "eos", "ts", "rid"}                        streamed input finished
+      {"ev": "step", "t0", "t1", "t2", "ntok", "nreq", "prefill": [...]}
+      {"ev": "first", "ts", "rid"}                      first output token emitted
+      {"ev": "finish", "ts", "rid", "out", "reason"}    request finished; out = output
+                                                        tokens generated
+    t0/t1/t2 bracket schedule() and execute_model(), so t2 - t1 is the step's
+    forward pass. Each prefill entry is [rid, prompt tokens computed this step,
+    tokens computed before it, prompt length now, prefix-cache hit tokens,
+    streaming, input finished]. Prefix-cache hits are not counted as computed.
+    Output tokens are counted from the engine's own per-step outputs, so they
+    are exact, not a re-tokenization of the returned text.
+    """
+
+    def __init__(self, directory: str):
+        os.makedirs(directory, exist_ok=True)
+        path = os.path.join(directory, f"prefill_trace_{os.getpid()}.jsonl")
+        self._file = open(path, "a", buffering=1)
+        self._out_tokens: dict[str, int] = {}
+
+    def _write(self, record: dict) -> None:
+        self._file.write(msgspec.json.encode(record).decode() + "\n")
+
+    def event(self, ev: str, rid: str, **fields) -> None:
+        self._write({"ev": ev, "ts": time.time(), "rid": rid, **fields})
+
+    def step(self, t0: float, t1: float, t2: float,
+             scheduler_output: SchedulerOutput, requests: dict) -> None:
+        entries = []
+        for rid, num_tokens in scheduler_output.num_scheduled_tokens.items():
+            req = requests.get(rid)
+            if req is None:
+                continue
+            # schedule() has already advanced num_computed_tokens.
+            after = req.num_computed_tokens
+            before = after - num_tokens
+            prompt_len = len(req.prompt_token_ids)
+            prefill = max(0, min(after, prompt_len) - before)
+            if prefill:
+                entries.append([rid, prefill, before, prompt_len,
+                                req.num_cached_tokens,
+                                int(req.is_streaming_prefill),
+                                int(req.is_streaming_prefill_stopped)])
+        self._write({"ev": "step", "t0": t0, "t1": t1, "t2": t2,
+                     "ntok": scheduler_output.total_num_scheduled_tokens,
+                     "nreq": len(scheduler_output.num_scheduled_tokens),
+                     "prefill": entries})
+
+    def outputs(self, engine_core_outputs: dict) -> None:
+        """Count output tokens per request; log first token and finish."""
+        for outs in engine_core_outputs.values():
+            for out in outs.outputs:
+                rid, n = out.request_id, len(out.new_token_ids)
+                if n and rid not in self._out_tokens:
+                    self.event("first", rid)
+                    self._out_tokens[rid] = 0
+                if n:
+                    self._out_tokens[rid] += n
+                if out.finish_reason is not None:
+                    self.event("finish", rid, out=self._out_tokens.pop(rid, 0),
+                               reason=str(out.finish_reason))
+
+
+_PREFILL_TRACE_DIR = os.environ.get("VLLM_PREFILL_TRACE_DIR")
+
+
 class EngineCore:
     """Inner loop of vLLM's Engine."""
 
@@ -166,6 +237,11 @@ class EngineCore:
 
         self.step_fn = (self.step if self.batch_queue is None else
                         self.step_with_batch_queue)
+        # Only the plain step() path is traced; the batch queue (pipeline
+        # parallelism) overlaps steps, so its timestamps would not be per step.
+        self._prefill_trace = (_PrefillTrace(_PREFILL_TRACE_DIR)
+                               if _PREFILL_TRACE_DIR and self.batch_queue is None
+                               else None)
 
     def _initialize_kv_caches(
             self, vllm_config: VllmConfig) -> tuple[int, int, KVCacheConfig]:
@@ -242,12 +318,21 @@ class EngineCore:
                            "Disabling KVTransfer for this request.")
 
         self.scheduler.add_request(request)
+        if self._prefill_trace is not None:
+            self._prefill_trace.event(
+                "add", request.request_id,
+                plen=len(request.prompt_token_ids or ()),
+                streaming=int(request.is_streaming_prefill))
 
     def stream_prefill_tokens(self, request_id: str, token_ids: list[int]):
         self.scheduler.stream_prefill_tokens(request_id, token_ids)
+        if self._prefill_trace is not None:
+            self._prefill_trace.event("chunk", request_id, n=len(token_ids))
 
     def stop_prefill_stream(self, request_id: str):
         self.scheduler.stop_prefill_stream(request_id)
+        if self._prefill_trace is not None:
+            self._prefill_trace.event("eos", request_id)
 
     def abort_requests(self, request_ids: list[str]):
         """Abort requests from the scheduler."""
@@ -287,12 +372,21 @@ class EngineCore:
         # or finished and not yet removed from the batch.
         if not self.scheduler.has_requests():
             return {}, False
+        t0 = time.time()
         scheduler_output = self.scheduler.schedule()
+        t1 = time.time()
         model_output = self.execute_model_with_error_logging(
             self.model_executor.execute_model,  # type: ignore
             scheduler_output)
+        if (self._prefill_trace is not None
+                and scheduler_output.total_num_scheduled_tokens > 0):
+            # Before update_from_output, which drops finished requests.
+            self._prefill_trace.step(t0, t1, time.time(), scheduler_output,
+                                     self.scheduler.requests)
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output)  # type: ignore
+        if self._prefill_trace is not None and engine_core_outputs:
+            self._prefill_trace.outputs(engine_core_outputs)
 
         return (engine_core_outputs,
                 scheduler_output.total_num_scheduled_tokens > 0)
